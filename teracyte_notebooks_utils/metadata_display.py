@@ -50,77 +50,33 @@ def display_hardware_metadata(exp_metadata: dict, sample_metadata: dict):
 
 
 def display_sample_metadata(exp_metadata: dict, sample_metadata: dict):
-    sample_keys = ['name', 'index', 'id', 'timestamp', 'sequences']
-    sample_data = {k: sample_metadata[k] for k in sample_keys if k in sample_metadata}
-    sample_data['experimentTimestamp'] = exp_metadata.get('timestamp')
+    # Create a mapping of keys to display names for consistent formatting
+    key_display_mapping = {
+        'name': 'Name',
+        'index': 'Index', 
+        'id': 'ID',
+        'timestamp': 'Timestamp'
+    }
+    
+    sample_data = {}
+    for key in ['name', 'index', 'id', 'timestamp']:
+        if key in sample_metadata:
+            display_name = key_display_mapping[key]
+            sample_data[display_name] = sample_metadata[key]
+    
+    # Add number of timepoints instead of the sequences list
+    sequences = sample_metadata.get('sequences', [])
+    if isinstance(sequences, list):
+        sample_data['Number of Timepoints'] = len(sequences)
+    else:
+        sample_data['Number of Timepoints'] = 'N/A'
+    
     sample_df = pd.DataFrame(sample_data.items(), columns=["Key", "Value"])
 
     sample_name = sample_metadata.get('name', 'Unnamed Sample')
     display(Markdown(f"### Sample Metadata — `{sample_name}`"))
     display(sample_df.style.hide(axis="index"))
 
-
-def display_parquet_data_progress(sample: Sample):
-    """
-    Display a table of sequence metadata using ONLY the partition hierarchy.
-    Columns: [sequence, sequence_timestamp, number of fovs, fovs, missing fovs, number of missing fovs]
-    - Uses sample.get_partition_hierarchy() instead of querying the dataframe
-    """
-    # Get the partition hierarchy - this is our single source of truth
-    hierarchy = sample.get_partition_hierarchy()
-    
-    if "error" in hierarchy:
-        display(HTML(f"<div style='color: red;'>Error loading partition hierarchy: {hierarchy['error']}</div>"))
-        return
-    
-    if "message" in hierarchy or "sequence" not in hierarchy:
-        display(HTML(f"<div style='color: blue;'>No sequence data found in partition hierarchy</div>"))
-        return
-    
-    # Build rows using ONLY hierarchy data
-    rows = []
-    parquet_sequences = sample.parquet_metadata.get("sequences", {})
-    
-    for seq_id, seq_data in hierarchy["sequence"].items():
-        # Get metadata for this sequence
-        seq_meta = parquet_sequences.get(str(seq_id), {})
-        
-        # Extract FOVs from hierarchy (not from df!)
-        fovs = seq_data.get("fov", [])
-        fovs = sorted([int(x) for x in fovs])  # Ensure they're integers and sorted
-        num_fovs = len(fovs)
-        
-        # Compute missing FOVs (continuous list)
-        if fovs:
-            all_fovs = set(range(sample.sample_metadata.get("fovs_num")))
-            missing_fovs = sorted(list(all_fovs - set(fovs)))
-        else:
-            missing_fovs = []
-        
-        rows.append({
-            "sequence": seq_id,
-            "sequence_timestamp": seq_meta.get("sequence_timestamp", "-"),
-            "sequence_elapsed_time (minutes)": seq_meta.get("sequence_elapsed_time_minutes", "-"),
-            "sequence_elapsed_time (hours)": seq_meta.get("sequence_elapsed_time_hours", "-"),
-            "number_of_fovs": num_fovs,
-            "fovs": fovs,
-            "missing_fovs": missing_fovs,
-            "number_of_missing_fovs": len(missing_fovs)
-        })
-    
-    # Create and display the same table format as before
-    table_df = pd.DataFrame(rows, columns=["sequence", "sequence_timestamp", "fovs", "number_of_fovs", "missing_fovs", "number_of_missing_fovs"])
-    display(Markdown(f"### FOVs count per sequence"))
-    
-    # Style: equal column width and centered column names
-    styled = table_df.style.hide(axis="index") \
-        .set_table_styles([
-            {"selector": "th", "props": [("text-align", "center"), ("font-weight", "bold")]},
-            {"selector": "td", "props": [("text-align", "center")]} 
-        ])
-    display(styled)
-    
-    return table_df
 
 
 def display_serial_number_records(serial_number, user_id, style='html'):
@@ -176,12 +132,27 @@ def display_serial_number_records(serial_number, user_id, style='html'):
             
             assay_name = assay_metadata.get('name', sample.get('sample_name', 'N/A'))
             experiment_name = exp_metadata.get('exp_name', 'N/A')
+            assay_timestamp = assay_metadata.get('timestamp', 'N/A')
+            
+            # Format timestamp with UTC notation in a nice format
+            if assay_timestamp != 'N/A':
+                try:
+                    # Parse the ISO timestamp and format it nicely
+                    from datetime import datetime
+                    dt = datetime.fromisoformat(assay_timestamp.replace('Z', '+00:00'))
+                    assay_timestamp_display = f"{dt.strftime('%Y-%m-%d %H:%M')} (UTC)"
+                except (ValueError, AttributeError):
+                    # Fallback to original format if parsing fails
+                    assay_timestamp_display = f"{assay_timestamp} (UTC)"
+            else:
+                assay_timestamp_display = 'N/A'
             
             records.append({
                 'Experiment Name': experiment_name,
                 'Assay Name': assay_name,
                 'Experiment ID': exp_id,
                 'Assay ID': assay_id,
+                'Assay Timestamp': assay_timestamp_display,
             })
         
         if not records:
