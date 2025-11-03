@@ -74,6 +74,6 @@ If you prefer to run the notebooks on your own computer:
 
 ## 🛟 Support
 
-If you need help or have questions, please reach out to your TeraCyte representative or email support@teracyte.ai.
+If you need help or have questions, please reach out to your TeraCyte representative or email info@teracyte.ai.
 
 Enjoy exploring your data!
