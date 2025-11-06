@@ -1,8 +1,8 @@
 # Standard library
-import json
-from uuid import uuid4
 from itertools import islice
-from IPython.display import display as ipython_display
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+import pandas as pd
 
 # Scientific / data analysis
 import numpy as np
@@ -13,8 +13,8 @@ from sklearn.cluster import DBSCAN
 
 # Interactive widgets & display
 import ipywidgets as widgets
-from ipywidgets import VBox, HBox, Text, Dropdown, ToggleButtons, SelectMultiple
-from IPython.display import display, clear_output, HTML
+from ipywidgets import Text, Dropdown
+from IPython.display import display, clear_output
 
 # Plotly
 import plotly.graph_objects as go
@@ -42,11 +42,10 @@ from bokeh.models import (
     ResetTool,
     SaveTool,
 )
-from bokeh.models.scales import LinearScale, LogScale
 from bokeh.palettes import Category10, Category20, Turbo256, Viridis256
 
 # Project-specific
-from .constants import PARQUET_FILES, MAGNIFICATION_GRID_CONFIG
+from .constants import MAGNIFICATION_GRID_CONFIG, TIME_COL_NAME
 from .vizarr_viewer import _create_visual_grid
 from .sample import Sample
 from .data_query import get_assay_workflows_status
@@ -80,7 +79,7 @@ def parquet_seq_fov_heatmaps(sample: Sample, parquet_data_progress: pd.DataFrame
 
         ax.set_xticks([])
         ax.set_yticks([])
-        plt.title(f"Parquet data in sequence {seq.sequence}")
+        plt.title(f"Parquet data in time point {seq.sequence}")
         plt.show()
 
 
@@ -192,7 +191,7 @@ def workflows_progress_heatmaps(sample: Sample, workflows_df: pd.DataFrame):
         
         # Set title and remove axes
         workflow_name = seq_workflows.iloc[0]['workflow_name'] if len(seq_workflows) > 0 else 'No Data'
-        ax.set_title(f"Workflow Progress - {workflow_name} - Sequence {seq}", 
+        ax.set_title(f"Workflow Progress - {workflow_name} - Time Point {seq}", 
                     fontsize=14, pad=20)
         
         ax.set_xticks([])
@@ -210,7 +209,7 @@ def workflows_progress_heatmaps(sample: Sample, workflows_df: pd.DataFrame):
         # Print workflow summary
         if len(seq_workflows) > 0:
             phase_counts = seq_workflows['phase'].value_counts()
-            print(f"\n📊 Workflow Summary for Sequence {seq}: Total {len(seq_workflows)}")
+            print(f"\n📊 Workflow Summary for Time Point {seq}: Total {len(seq_workflows)}")
             for phase, count in phase_counts.items():
                 print(f"  {phase}: {count}")
 
@@ -234,7 +233,7 @@ def create_workflow_selector(sample: Sample):
     sequence_dropdown = widgets.Dropdown(
         options=sequences_options,
         value=sequences_options[0] if sequences_options else '0',
-        description='Sequence:',
+        description='Time Point:',
         disabled=False,
         style={'description_width': 'initial'}
     )
@@ -291,22 +290,85 @@ def create_workflow_selector(sample: Sample):
     return interface
 
 
-def create_dataframe_selector(sample):
-    """
-    Create a widget to select which dataframe to work with.
-    Options: 'cells', 'wells', 'colocalization'
-    Returns the widget.
-    """
-    df_options = sample.available_parquet_types
-    
+def create_dataframe_selector(sample):    
+    types = getattr(sample, "available_parquet_types", [])
+
+    def has_data(t):
+        try:
+            # Check if the parquet type is available (exists on server)
+            # not if data is already loaded into memory
+            return sample.has_parquet_type(t)
+        except Exception:
+            return False
+
+    options = [t for t in types if has_data(t)]
+
     selector = widgets.Dropdown(
-        options=df_options,
-        value=df_options[0] if len(df_options) > 0 else None,
+        options=options,
+        value=options[0] if options else None,
         description="Select DataFrame:",
         style={'description_width': 'initial'},
-        layout=widgets.Layout(width='300px')
+        layout=widgets.Layout(width='300px'),
+        disabled=not options
     )
-    display(selector)
+    
+    # Create output area for status messages
+    output_area = widgets.Output()
+    
+    # Create a global variable to store the loaded data
+    global data
+    data = pd.DataFrame()
+    
+    def on_selection_change(change):
+        """Handle dropdown selection changes and automatically load data"""
+        global data
+        selected_type = change['new']
+        
+        with output_area:
+            clear_output(wait=True)
+            if selected_type:
+                print(f"🔄 Loading {selected_type} data...")
+                try:
+                    # Get the dataframe (this will be empty if not loaded yet)
+                    data = sample.get_dataframe(selected_type)
+                    
+                    if data.empty:
+                        print(f"📊 {selected_type} data not loaded yet. Available for loading.")
+                        print(f"💡 Use the 'Interactive Data Query' section above to load data first.")
+                    else:
+                        print(f"✅ {selected_type} data loaded successfully!")
+                        print(f"📈 Shape: {data.shape[0]:,} rows × {data.shape[1]} columns")
+                        
+                        # Show a preview of the data
+                        if not data.empty:
+                            print(f"\n🔍 Data preview:")
+                            print(data.head(3).to_string())
+                    
+                except Exception as e:
+                    print(f"❌ Error loading {selected_type}: {str(e)}")
+                    data = pd.DataFrame()
+            else:
+                print("No dataframe type selected")
+                data = pd.DataFrame()
+    
+    # Connect the change handler
+    selector.observe(on_selection_change, names='value')
+    
+    # Create the complete interface
+    interface = widgets.VBox([
+        selector,
+        output_area
+    ])
+    
+    # Trigger initial load
+    if options:
+        on_selection_change({'new': options[0]})
+    
+    display(interface)
+    
+    # Store a reference to the current data in the selector for easy access
+    selector.current_data = lambda: data
+    
     return selector
 
 
@@ -320,116 +382,126 @@ def remove_outliers(series):
     return series[(series >= lower_bound) & (series <= upper_bound)]
 
 
-def remove_outliers_from_dataframe(df, feature_columns=None, groupby_columns=['sequence', 'channel_index', 'fov', 'z_index'], data_type="wells_data"):
+def remove_outliers_from_dataframe(
+    df,
+    sample=None,  # <-- keep for backward compat but not required
+    feature_columns=None,
+    groupby_columns=['timepoint','channel_index', 'fov', 'z_index'],
+    data_type="wells_data"
+):
     """
-    Remove outliers from specified feature columns in a DataFrame using IQR method.
-    
-    Parameters:
-        df (pd.DataFrame): DataFrame to process
-        feature_columns (list): List of feature columns to process. If None, uses PARQUET_FILES[data_type]["feature_columns"]
-        groupby_columns (list): Columns to group by when calculating outliers
-        data_type (str): The data type key to use for PARQUET_FILES lookup
-        
-    Returns:
-        pd.DataFrame: DataFrame with outliers removed
-        
-    Raises:
-        ValueError: If inputs are invalid
+    Remove outliers from specified feature columns using the IQR method.
+    Outliers are set to NaN (row count unchanged).
     """
-
     try:
-        # Input validation
         if not isinstance(df, pd.DataFrame):
             raise TypeError(f"df must be a pandas DataFrame, got {type(df).__name__}")
-        
         if df.empty:
-            print("⚠️ Warning: DataFrame is empty, returning unchanged")
+            print("⚠️ DataFrame is empty, returning unchanged.")
             return df.copy()
-        
+
+        # --- Only use what's inside df when feature_columns is None ---
         if feature_columns is None:
-            feature_columns = PARQUET_FILES[data_type]["feature_columns"]
-        
-        # Filter to only include features that exist in the DataFrame
-        available_features = [col for col in feature_columns if col in df.columns]
-        
+            # If a sample with parquet configs was provided, use it; otherwise infer from df
+            if sample is not None:
+                try:
+                    feature_columns = sample.parquet_configs[data_type]["feature_columns"]
+                except Exception:
+                    # Fallback to numeric columns present in df
+                    feature_columns = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+            else:
+                feature_columns = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+
         if not isinstance(feature_columns, (list, tuple)):
             raise TypeError(f"feature_columns must be a list or tuple, got {type(feature_columns).__name__}")
-        
         if not isinstance(groupby_columns, (list, tuple)):
             raise TypeError(f"groupby_columns must be a list or tuple, got {type(groupby_columns).__name__}")
-        
-        # Check if groupby columns exist
-        missing_groupby_cols = [col for col in groupby_columns if col not in df.columns]
-        if missing_groupby_cols:
-            print(f"⚠️ Warning: Missing groupby columns {missing_groupby_cols}, skipping grouping")
-            groupby_columns = []
-        
+
+        # ---- Column resolution ----
+        candidate_features = [c for c in feature_columns if c in df.columns]
+        available_features = [c for c in candidate_features if pd.api.types.is_numeric_dtype(df[c])]
+
+        missing_groupby = [c for c in groupby_columns if c not in df.columns]
+        effective_groupby = [c for c in groupby_columns if c in df.columns]
+        if missing_groupby:
+            print(f"⚠️ Missing group-by columns skipped: {missing_groupby}")
+        if not effective_groupby:
+            print("ℹ️ No valid group-by columns found; applying global outlier removal.")
+
+        if not available_features:
+            print("⚠️ No numeric feature columns available to process. Returning unchanged.")
+            return df.copy()
+
+        print("🧹 Starting outlier removal")
+        print(f"    Data shape: {df.shape[0]:,} rows × {df.shape[1]:,} cols")
+        print(f"    Group-by: {effective_groupby if effective_groupby else 'Global (no grouping)'}")
+
         result_df = df.copy()
-        processed_features = 0
-        
-        print(f"🧹 Starting outlier removal for {len(available_features)} features:")
-        
+
+        baseline_non_null = result_df[available_features].notna().sum().sum()
+
         for feature in available_features:
-            try:
-                original_count = result_df[feature].notna().sum()
-                
-                if original_count == 0:
-                    print(f"⚠️ Warning: No valid data for feature '{feature}', skipping")
-                    continue
-                
-                # Apply outlier removal
-                if groupby_columns:
-                    filtered_values = (
-                        result_df.groupby(groupby_columns)[feature]
-                        .transform(remove_outliers)
-                    )
-                else:
-                    # Apply outlier removal to entire column if no grouping
-                    filtered_values = remove_outliers(result_df[feature])
-                
-                # Handle dtype compatibility when assigning back
-                if filtered_values.dtype != result_df[feature].dtype:
-                    # Convert to nullable integer type if original was integer
-                    if pd.api.types.is_integer_dtype(result_df[feature].dtype):
-                        result_df[feature] = filtered_values.astype('Int64')
-                    else:
-                        result_df[feature] = filtered_values
-                else:
-                    result_df.loc[:, feature] = filtered_values
-                
-                final_count = result_df[feature].notna().sum()
-                removed_count = original_count - final_count
-                removal_pct = (removed_count / original_count * 100) if original_count > 0 else 0
-                
-                print(f"   ✅ {feature}: {removed_count} outliers removed ({removal_pct:.1f}%) - {final_count}/{original_count} values retained")
-                processed_features += 1
-                
-            except Exception as e:
-                print(f"❌ Error processing feature '{feature}': {str(e)}")
+            original_count = result_df[feature].notna().sum()
+            if original_count == 0:
+                print(f"   ⚠️ {feature}: no valid values; skipped.")
                 continue
-        
-        print(f"🎯 Outlier removal completed: {processed_features}/{len(available_features)} features processed")
+
+            if effective_groupby:
+                filtered_values = (
+                    result_df.groupby(effective_groupby, dropna=False)[feature]
+                             .transform(remove_outliers)
+                )
+            else:
+                filtered_values = remove_outliers(result_df[feature])
+
+            # dtype-safe assignment
+            if pd.api.types.is_integer_dtype(result_df[feature].dtype):
+                result_df[feature] = pd.Series(filtered_values, index=result_df.index).astype('Int64')
+            else:
+                result_df[feature] = pd.Series(filtered_values, index=result_df.index)
+
+            final_count = result_df[feature].notna().sum()
+            removed_count = int(original_count - final_count)
+            final_pct = (final_count / original_count * 100) if original_count > 0 else 100
+            removal_pct = (removed_count / original_count * 100) if original_count else 0.0
+
+
+            print(f"   ✅ {feature}: removed {removed_count} ({removal_pct:.1f}%) "
+                  f"- {final_count}/{original_count} values retained ({final_pct:.1f}%)")
+
+            
+        after_non_null = result_df[available_features].notna().sum().sum()
+        delta = int(baseline_non_null - after_non_null)
+        print("\n🎯 Outlier removal completed.")
+
         return result_df
-        
+
     except Exception as e:
-        print(f"❌ Critical error in remove_outliers_from_dataframe: {str(e)}")
-        import traceback
-        traceback.print_exc()
+        print(f"❌ Critical error in remove_outliers_from_dataframe: {e}")
+        import traceback; traceback.print_exc()
         return df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
 
 
-def create_outlier_filtering_controls(data, data_type="wells_data"):
+
+def create_outlier_filtering_controls(sample, data, data_type="wells_data"):
     """Create interactive controls for outlier filtering option with advanced parameters."""
+
+    # Determine the time column: pick the first matching name from TIME_COL_NAME
+    # TIME_COL_NAME is expected to be an iterable of candidate column names
+    time_col_candidates = [c for c in TIME_COL_NAME if c in data.columns] if 'TIME_COL_NAME' in globals() else []
+    time_col = time_col_candidates[0] if time_col_candidates else None
     try:
         # Initialize filtered_df with original data (will be updated when button is clicked)
         global filtered_df
         filtered_df = data.copy()
         
         # Get available feature columns and groupby columns
-        available_features = [col for col in PARQUET_FILES[data_type]["feature_columns"] if col in data.columns]
-        available_groupby_cols = ['None', 'sequence', 'channel_index', 'fov', 'z_index']
+        available_features = [c for c in sample.parquet_configs[data_type]["feature_columns"]
+                                if c in data.columns and pd.api.types.is_numeric_dtype(data[c])]
+        
+        available_groupby_cols = [time_col, 'channel_index', 'fov', 'z_index']
         # Filter available columns (but keep 'None' as a special option)
-        data_columns = [col for col in available_groupby_cols[1:] if col in data.columns]  # Skip 'None'
+        data_columns = [col for col in available_groupby_cols if col in data.columns]   
         available_groupby_cols = ['None'] + data_columns
         
         # Create widgets
@@ -450,7 +522,7 @@ def create_outlier_filtering_controls(data, data_type="wells_data"):
         )
         
         # Groupby columns selection - set default to available columns (excluding 'None')
-        default_groupby = [col for col in ['sequence', 'channel_index', 'fov','z_index'] if col in data_columns]
+        default_groupby = [col for col in [time_col, 'channel_index', 'fov','z_index'] if col in data_columns]
         groupby_columns_widget = widgets.SelectMultiple(
             options=available_groupby_cols,
             value=default_groupby,  # Default grouping with available columns
@@ -472,7 +544,7 @@ def create_outlier_filtering_controls(data, data_type="wells_data"):
             widgets.HTML("<p style='color: #666; font-size: 12px;'>Select specific features and grouping strategy for outlier detection:</p>"),
             feature_columns_widget,
             groupby_columns_widget,
-            widgets.HTML("<p style='color: #666; font-size: 11px;'><b>Group By:</b> Outliers calculated within each group combination. Select 'None' for global outlier removal across all data.</p>")
+            widgets.HTML("<p style='color: #666; font-size: 11px;'><b>Group By:</b> Outliers calculated within each group combination.  Select 'None' for global outlier removal across all data.</p>")
         ], layout=widgets.Layout(display='none'))
         
         def toggle_advanced_options(change):
@@ -526,6 +598,7 @@ def create_outlier_filtering_controls(data, data_type="wells_data"):
                         global filtered_df
                         filtered_df = remove_outliers_from_dataframe(
                             data, 
+                            sample,
                             feature_columns=selected_features,
                             groupby_columns=selected_groupby,
                             data_type=data_type
@@ -917,7 +990,7 @@ def chip_heatmap_controls(filtered_df, sample, data_type="wells_data"):
     Parameters:
         filtered_df (pd.DataFrame): DataFrame to extract options from
         sample: Sample object containing channel information
-        data_type (str): The data type key to use for PARQUET_FILES lookup
+        data_type (str): The data type key 
         
     Returns:
         None: Displays the control widgets
@@ -926,24 +999,29 @@ def chip_heatmap_controls(filtered_df, sample, data_type="wells_data"):
         ValueError: If DataFrame is invalid or missing required columns
     """
     try:
-        global selected_title, selected_channel, selected_timepoint, selected_feature   
+        global selected_title, selected_channel, selected_timepoint, selected_feature
+
+        # Determine the time column: pick the first matching name from TIME_COL_NAME
+        # TIME_COL_NAME is expected to be an iterable of candidate column names
+        time_col_candidates = [c for c in TIME_COL_NAME if c in filtered_df.columns] if 'TIME_COL_NAME' in globals() else []
+        time_col = time_col_candidates[0] if time_col_candidates else None
 
         # Input validation
         if not isinstance(filtered_df, pd.DataFrame):
             raise TypeError(f"filtered_df must be a pandas DataFrame, got {type(filtered_df).__name__}")
-        
+
         if filtered_df.empty:
             raise ValueError("DataFrame is empty")
-        
-        required_columns = ['sequence']
+
+        required_columns = list(time_col_candidates)
         missing_columns = [col for col in required_columns if col not in filtered_df.columns]
         if missing_columns:
             raise ValueError(f"DataFrame missing required columns: {missing_columns}")
 
         try:
-            timepoints = sorted(filtered_df['sequence'].unique().astype(int))
+            timepoints = sorted(filtered_df[time_col].unique().astype(int))
             if not timepoints:
-                raise ValueError("No timepoints found in sequence column")
+                raise ValueError("No timepoints found in time point column")
         except Exception as e:
             print(f"⚠️ Warning: Error extracting timepoints: {str(e)}")
             timepoints = [0]  # Default fallback
@@ -974,7 +1052,7 @@ def chip_heatmap_controls(filtered_df, sample, data_type="wells_data"):
             )
 
             # Validate feature columns exist
-            available_features = [f for f in PARQUET_FILES[data_type]["feature_columns"] if f in filtered_df.columns]
+            available_features = [f for f in sample.parquet_configs[data_type]["feature_columns"] if f in filtered_df.columns]
             if not available_features:
                 print(f"⚠️ Warning: No feature columns found. Available columns: {list(filtered_df.columns)}")
                 available_features = ['placeholder_feature']
@@ -987,7 +1065,7 @@ def chip_heatmap_controls(filtered_df, sample, data_type="wells_data"):
             timepoint_widget = Dropdown(
                 options=timepoints,
                 value=timepoints[0] if timepoints else None,
-                description='Sequence:'
+                description='Time Point:'
             )
 
             # Create button for generating heatmap
@@ -1115,26 +1193,30 @@ def run_heatmap(filtered_df, sample, selected_feature, selected_title, selected_
             return
         
         # Validate required columns
-        required_columns = ['channel_index', 'sequence']
+        # Determine the time column: pick the first matching name from TIME_COL_NAME
+        # TIME_COL_NAME is expected to be an iterable of candidate column names
+        time_col_candidates = [c for c in TIME_COL_NAME if c in filtered_df.columns] if 'TIME_COL_NAME' in globals() else []
+        time_col = time_col_candidates[0] if time_col_candidates else None
+        required_columns = ['channel_index'] + ([time_col] if time_col else [])
         missing_columns = [col for col in required_columns if col not in filtered_df.columns]
         if missing_columns:
             print(f"❌ DataFrame missing required columns: {missing_columns}")
             return
-        
+
         # Filter data based on selection
         try:
             data_subset = filtered_df[
                 (filtered_df['channel_index'] == selected_channel) & 
-                (filtered_df['sequence'] == selected_timepoint)
+                (filtered_df[time_col] == selected_timepoint)
             ]
-            
+
             if data_subset.empty:
                 print(f"❌ No data available for the selected combination:")
-                print(f"   Channel: {selected_channel}, Timepoint: {selected_timepoint}")
+                print(f"   Channel: {selected_channel}, Time Point: {selected_timepoint}")
                 print(f"   Available channels: {sorted(filtered_df['channel_index'].unique())}")
-                print(f"   Available sequences: {sorted(filtered_df['sequence'].unique())}")
+                print(f"   Available time points: {sorted(filtered_df[time_col].unique())}")
                 return
-                
+
         except Exception as e:
             print(f"❌ Error filtering data: {str(e)}")
             return
@@ -1142,21 +1224,21 @@ def run_heatmap(filtered_df, sample, selected_feature, selected_title, selected_
         # Validate feature exists in data
         if selected_feature not in data_subset.columns:
             print(f"❌ Feature '{selected_feature}' not found in data.")
-            print(f"   Available features: {[col for col in data_subset.columns if col in PARQUET_FILES['wells_data']['feature_columns']]}")
+            print(f"   Available features: {[col for col in data_subset.columns if col in sample.parquet_configs['wells_data']['feature_columns']]}")
             return
         
         # Create plot title using channel name instead of channel number
         try:
             # Use channel name for title if provided, otherwise fall back to channel index
             channel_display = channel_name_for_title if channel_name_for_title else f"Channel {selected_channel}"
-            plot_title = f"{selected_title}, Sequence {selected_timepoint}, {channel_display}, {selected_feature.replace('_',' ')}"
+            plot_title = f"{selected_title}, Time Point {selected_timepoint}, {channel_display}, {selected_feature.replace('_',' ')}"
         except Exception as e:
             print(f"⚠️ Warning: Error creating plot title: {str(e)}")
             plot_title = f"Heatmap - {selected_feature}"
         
         print(f"🎯 Creating heatmap for:")
         print(f"   Feature: {selected_feature}")
-        print(f"   Sequence: {selected_timepoint}")
+        print(f"   Time Point: {selected_timepoint}")
         print(f"   Channel: {selected_channel}")
         print(f"   Data points: {len(data_subset)}")
         
@@ -1174,360 +1256,410 @@ def run_heatmap(filtered_df, sample, selected_feature, selected_title, selected_
         traceback.print_exc()
 
 
+
 def plot_interactive_scatter(df, controls, eps=300, min_samples=5):
     """
     Create an interactive Bokeh scatter plot with selection and saving capabilities.
-    
+
+    - Enforces an automatic truncation to MAX_FOVS to avoid creating extremely large plots that exhaust RAM.
+    - User can override truncation by setting the 'force_full_fovs' control to True (explicit override).
+
     Parameters:
         df (pd.DataFrame): DataFrame with data
         controls (dict): Dictionary of control widgets
         eps (float): DBSCAN epsilon parameter
         min_samples (int): DBSCAN minimum samples parameter
-        
+
     Returns:
         dict: Dictionary of saved queries
-        
+
     Raises:
         ValueError: If inputs are invalid or missing required data
     """
     try:
+
         global selected_global_indices
         selected_global_indices = []
+
+        MAX_FOVS = 30  # soft limit to avoid excessive memory usage on slow machines
+
+        # helper to format selected fovs for printing
+        def fmt_fovs(fov_list):
+            try:
+                ints = [int(x) for x in fov_list]
+            except Exception:
+                # fallback to string conversion
+                ints = [str(x) for x in fov_list]
+            if len(ints) <= 10:
+                return ",".join(map(str, ints))
+            return ",".join(map(str, ints[:10])) + ",..."
 
         # Input validation
         if not isinstance(df, pd.DataFrame):
             raise TypeError(f"df must be a pandas DataFrame, got {type(df).__name__}")
-        
+
         if df.empty:
             raise ValueError("DataFrame is empty")
-        
+
         if not isinstance(controls, dict):
             raise TypeError(f"controls must be a dictionary, got {type(controls).__name__}")
-    
 
-        # Check required control keys based on comparison mode
-        basic_keys = ['classification_mode', 'sequence', 'run_clustering', 'fov', 'title']
+        # Determine candidate time column names from TIME_COL_NAME (if present in workspace)
+        time_col_candidates = [c for c in TIME_COL_NAME if c in df.columns] if 'TIME_COL_NAME' in globals() else []
+        time_col = time_col_candidates[0] if time_col_candidates else None
+
+        # Preferred control keys to try (detected column name first, then common legacy names)
+        candidate_keys = []
+        if time_col:
+            candidate_keys.append(time_col)
+        candidate_keys += ['timepoint', 'sequence', 'time', 'tp', 'selected_timepoint']
+
+        # Find a control key that matches one of the preferred names
+        time_control_key = next((k for k in candidate_keys if k in controls), None)
+
+        # If not found, try a heuristic: pick the first control with a scalar numeric-like .value that is not a multi-select
+        if not time_control_key:
+            for k, w in controls.items():
+                try:
+                    val = getattr(w, 'value', None)
+                except Exception:
+                    val = None
+                if val is None:
+                    continue
+                # skip list-like controls (e.g., fov multi-select)
+                if isinstance(val, (list, tuple, set)):
+                    continue
+                # numeric scalar types are good candidates
+                if isinstance(val, (int, float, np.integer, np.floating)):
+                    time_control_key = k
+                    break
+                # string digits
+                if isinstance(val, str) and val.isdigit():
+                    time_control_key = k
+                    break
+                # numpy scalar
+                if hasattr(val, '__array_priority__') or (hasattr(val, 'dtype') and np.isscalar(val)):
+                    try:
+                        if np.isscalar(val):
+                            time_control_key = k
+                            break
+                    except Exception:
+                        pass
+
+        # Build expected basic control keys; prefer the detected control key if present
+        basic_keys = ['classification_mode', 'run_clustering', 'fov', 'title']
+        if time_control_key:
+            basic_keys.insert(1, time_control_key)
+        else:
+            # If no control key found, still allow working if a DataFrame time column exists
+            # but keep a helpful error message that suggests which control is expected
+            basic_keys.insert(1, 'timepoint')
+
         missing_keys = [key for key in basic_keys if key not in controls]
-        if missing_keys:
+        # If only the time control is missing but we have a time column in the DataFrame, allow proceed (we'll try to resolve sequence below)
+        if missing_keys and not (missing_keys == ['timepoint'] and time_col is not None):
             raise ValueError(f"Missing required control keys: {missing_keys}")
 
         # Extract basic values from controls with error handling
         try:
             comparison_mode = controls['classification_mode']
-            sequence = controls['sequence'].value
+            # Sequence extraction: prefer the control widget we detected
+            sequence = None
+            if time_control_key and time_control_key in controls:
+                try:
+                    sequence = controls[time_control_key].value
+                except Exception:
+                    sequence = None
+
+            # Fallback: if sequence still None, look for a notebook-level selected_timepoint variable
+            if sequence is None and 'selected_timepoint' in globals():
+                try:
+                    sequence = globals()['selected_timepoint']
+                except Exception:
+                    sequence = None
+
             run_clustering = controls['run_clustering'].value
             selected_fovs = list(controls['fov'].value)
+            force_override = False
+            if 'force_full_fovs' in controls:
+                force_override = bool(controls['force_full_fovs'].value)
 
             if sequence is None:
-                raise ValueError("Sequence cannot be None")
-                
+                raise ValueError("Sequence cannot be determined from controls or notebook state (selected_timepoint).")
+
         except Exception as e:
             print(f"❌ Error extracting basic control values: {str(e)}")
             return {}
 
+        # Compute available FOVs and apply truncation/override logic
+        available_fovs = sorted(df['fov'].unique()) if 'fov' in df.columns else []
+        num_available = len(available_fovs)
+
+        # Resolve 'All' selection
+        user_requested_all = ('All' in selected_fovs)
+
+        if user_requested_all:
+            if num_available > MAX_FOVS and not force_override:
+                # Auto-truncate to first MAX_FOVS with a clear message
+                truncated = available_fovs[:MAX_FOVS]
+                print(f"⚠️ Too many FOVs available ({num_available}). Automatically using the first {MAX_FOVS} FOVs to avoid high memory usage.")
+                print("   To use all FOVs regardless of memory usage, enable 'Allow all FOVs' in the controls (unsafe).")
+                selected_fovs = truncated
+            else:
+                if num_available > MAX_FOVS and force_override:
+                    print(f"⚠️ Force override enabled: using all {num_available} FOVs (this may use a lot of RAM).")
+                selected_fovs = available_fovs
+        else:
+            # User explicitly selected a list of FOVs
+            if len(selected_fovs) > MAX_FOVS and not force_override:
+                truncated = selected_fovs[:MAX_FOVS]
+                print(f"⚠️ You selected {len(selected_fovs)} FOVs. Automatically using the first {MAX_FOVS} FOVs to avoid high memory usage.")
+                print("   To use all selected FOVs regardless of memory usage, enable 'Allow all FOVs' in the controls (unsafe).")
+                selected_fovs = truncated
+            elif len(selected_fovs) > MAX_FOVS and force_override:
+                print(f"⚠️ Force override enabled: using all {len(selected_fovs)} selected FOVs (this may use a lot of RAM).")
+
+        # Convert to plain python ints for nicer printing
+        try:
+            selected_fovs_display = [int(x) for x in selected_fovs]
+        except Exception:
+            selected_fovs_display = [str(x) for x in selected_fovs]
+
+        print(f"   Selected FOVs: {fmt_fovs(selected_fovs_display)}")
+
         # Extract mode-specific values
         try:
             if comparison_mode == 'features':
-                # Feature comparison mode: X and Y are different features, single channel
                 if 'channel' not in controls or 'x_feature' not in controls or 'y_feature' not in controls:
                     raise ValueError("Feature comparison mode requires 'channel', 'x_feature', and 'y_feature' controls")
-                
+
                 channel = controls['channel'].value
                 x_feature = controls['x_feature'].value
                 y_feature = controls['y_feature'].value
-                x_channel = y_channel = channel  # Same channel for both axes
+                x_channel = y_channel = channel
                 single_feature = None
-                
+
                 if not all([x_feature, y_feature, channel is not None]):
                     raise ValueError("Feature comparison mode: x_feature, y_feature, and channel cannot be None")
-                
+
                 print(f"🎯 Feature Comparison Mode:")
                 print(f"   Channel: {channel}")
                 print(f"   X Feature: {x_feature}")
                 print(f"   Y Feature: {y_feature}")
-                
+
             else:  # channels
-                # Channel comparison mode: X and Y are different channels, single feature
                 if 'feature' not in controls or 'x_channel' not in controls or 'y_channel' not in controls:
                     raise ValueError("Channel comparison mode requires 'feature', 'x_channel', and 'y_channel' controls")
-                
+
                 single_feature = controls['feature'].value
                 x_channel = controls['x_channel'].value
                 y_channel = controls['y_channel'].value
-                x_feature = y_feature = single_feature  # Same feature for both axes
-                channel = None  # Not used in this mode
-                
+                x_feature = y_feature = single_feature
+                channel = None
+
                 if not all([single_feature, x_channel is not None, y_channel is not None]):
                     raise ValueError("Channel comparison mode: feature, x_channel, and y_channel cannot be None")
-                
+
                 print(f"🎯 Channel Comparison Mode:")
                 print(f"   Feature: {single_feature}")
                 print(f"   X Channel: {x_channel}")
                 print(f"   Y Channel: {y_channel}")
-                
+
         except Exception as e:
             print(f"❌ Error extracting mode-specific control values: {str(e)}")
             return {}
 
         # Validate required columns exist in DataFrame
-        required_columns = ['sequence', 'fov', 'global_index', x_feature, y_feature]
-        
-        # Add channel_index column requirement for channel comparison mode
+        used_time_col = time_col  # actual DataFrame column name to filter by
+        required_columns = ([used_time_col] if used_time_col else []) + ['fov', 'global_index', x_feature, y_feature]
         if comparison_mode == 'channels':
             required_columns.append('channel_index')
-        
-        missing_columns = [col for col in required_columns if col not in df.columns]
+        missing_columns = [col for col in required_columns if col and col not in df.columns]
         if missing_columns:
             print(f"❌ DataFrame missing required columns: {missing_columns}")
             print(f"   Available columns: {list(df.columns)}")
             return {}
 
-        print(f"   Sequence: {sequence}")
-        print(f"   Selected FOVs: {selected_fovs}")
+        print(f"   Time Point: {sequence}")
 
-        # Filter data with error handling
+        # Filter data (keep minimal columns to reduce memory)
         try:
-            df_filtered = df[df['sequence'] == sequence].copy()
-            
-            if df_filtered.empty:
-                print(f"❌ No data found for sequence {sequence}")
-                print(f"   Available sequences: {sorted(df['sequence'].unique())}")
-                return {}
-                
-            if 'All' not in selected_fovs:
-                selected_fovs = [f for f in selected_fovs if f != 'All']
-                if not selected_fovs:
-                    print("❌ No FOVs selected.")
-                    return {}
-                    
-                original_count = len(df_filtered)
-                df_filtered = df_filtered[df_filtered['fov'].isin(selected_fovs)].copy()
-                
-                if df_filtered.empty:
-                    print(f"❌ No data found for selected FOVs: {selected_fovs}")
-                    print(f"   Available FOVs: {sorted(df['fov'].unique())}")
-                    return {}
-                    
-                print(f"📊 FOV filtering: {len(df_filtered)}/{original_count} rows retained")
-
-            # Apply mode-specific filtering
+            needed_cols_base = ['global_index', 'fov'] + ([used_time_col] if used_time_col else [])
             if comparison_mode == 'features':
-                # Feature comparison: filter by single channel
+                needed_cols = list(set(needed_cols_base + [x_feature, y_feature, 'channel_index']))
+            else:
+                # For channels mode we will merge two channel frames so keep channel_index and the feature
+                needed_cols = list(set(needed_cols_base + [single_feature, 'channel_index']))
+
+            # Ensure we can filter by sequence
+            if not used_time_col:
+                print("❌ Cannot filter by time point: no time column available in DataFrame")
+                return {}
+
+            # Filter by sequence and FOVs with minimal copying
+            mask_seq = df[used_time_col] == sequence
+            mask_fov = df['fov'].isin(selected_fovs)
+            df_filtered = df.loc[mask_seq & mask_fov, needed_cols].copy()
+
+            if df_filtered.empty:
+                print(f"❌ No data found for time point {sequence} and selected FOVs")
+                return {}
+
+            # If feature comparison, filter by channel
+            if comparison_mode == 'features':
                 if 'channel_index' in df_filtered.columns:
-                    original_count = len(df_filtered)
-                    df_filtered = df_filtered[df_filtered['channel_index'] == channel].copy()
-                    print(f"📊 Channel filtering: {len(df_filtered)}/{original_count} rows retained for channel {channel}")
-                else:
-                    print("⚠️ Warning: 'channel_index' column not found, skipping channel filtering")
-                    
-            else:  # channel comparison
-                # Channel comparison: we need data from both channels, will process separately
-                print(f"📊 Channel comparison: will process channels {x_channel} and {y_channel} separately")
-                
+                    mask_chan = df_filtered['channel_index'] == channel
+                    df_filtered = df_filtered.loc[mask_chan]
+                    if df_filtered.empty:
+                        print(f"❌ No data for channel {channel} in the selected sequence/FOVs")
+                        return {}
+
         except Exception as e:
-            print(f"❌ Error filtering data by sequence/FOV: {str(e)}")
+            print(f"❌ Error filtering data by time point/FOV: {str(e)}")
             return {}
 
-        # Prepare data based on comparison mode
+        # Prepare data based on comparison mode and cleanup; keep minimal columns
         try:
             if comparison_mode == 'features':
-                # Feature comparison mode: use filtered data as-is
-                final_df = df_filtered.copy()
-                
-                # Feature cleanup with error handling
+                final_df = df_filtered.dropna(subset=[x_feature, y_feature, 'global_index', 'fov']).copy()
+
+                # CTCF cleanup: set non-positive values to NaN (and drop later)
                 for feature in [x_feature, y_feature]:
                     if "ctcf" in feature.lower():
-                        original_count = len(final_df)
                         final_df[feature] = pd.to_numeric(final_df[feature], errors="coerce")
-                        final_df.loc[final_df[feature] < 0, feature] = np.nan
-                        valid_count = final_df[feature].notna().sum()
-                        print(f"🧹 CTCF cleanup for {feature}: {valid_count}/{original_count} values are valid")
-                
-                # Drop rows with missing values in required columns
-                columns_to_check = [x_feature, y_feature, 'global_index', 'fov']
-                original_count = len(final_df)
-                final_df = final_df[columns_to_check].dropna()
-                
+                        final_df.loc[final_df[feature] <= 0, feature] = np.nan
+
+                final_df = final_df.dropna(subset=[x_feature, y_feature])
                 if final_df.empty:
-                    print(f"❌ No data remaining after removing missing values.")
-                    print(f"   Original count: {original_count}")
+                    print("❌ No data remaining after cleaning features.")
                     return {}
-                    
-                print(f"🔍 Data cleaning: {len(final_df)}/{original_count} rows have complete data")
-                
-            else:  # channel comparison mode
-                # Channel comparison: merge data from two channels
+
+            else:
+                # channels mode: split and merge on minimal columns
                 if 'channel_index' not in df_filtered.columns:
                     print("❌ Error: 'channel_index' column required for channel comparison")
                     return {}
-                
-                # Get data for X channel
+
                 df_x = df_filtered[df_filtered['channel_index'] == x_channel].copy()
-                if df_x.empty:
-                    print(f"❌ No data found for X channel {x_channel}")
-                    return {}
-                
-                # Get data for Y channel  
                 df_y = df_filtered[df_filtered['channel_index'] == y_channel].copy()
-                if df_y.empty:
-                    print(f"❌ No data found for Y channel {y_channel}")
+                if df_x.empty or df_y.empty:
+                    print("❌ Missing channel data for selected channels in these FOVs/sequence")
                     return {}
-                
-                # Feature cleanup for the single feature
+
+                # CTCF cleanup if necessary
                 if "ctcf" in single_feature.lower():
-                    for channel_df, channel_name in [(df_x, f"X channel {x_channel}"), (df_y, f"Y channel {y_channel}")]:
-                        original_count = len(channel_df)
+                    for channel_df in (df_x, df_y):
                         channel_df[single_feature] = pd.to_numeric(channel_df[single_feature], errors="coerce")
-                        channel_df.loc[channel_df[single_feature] < 0, single_feature] = np.nan
-                        valid_count = channel_df[single_feature].notna().sum()
-                        print(f"🧹 CTCF cleanup for {channel_name}: {valid_count}/{original_count} values are valid")
-                
-                # Clean data: remove NaN values for the feature of interest
-                df_x_clean = df_x.dropna(subset=[single_feature]).copy()
-                df_y_clean = df_y.dropna(subset=[single_feature]).copy()
-                
-                # Merge on common columns to get paired data points
-                merge_cols = ['global_index', 'sequence', 'fov']
-                merge_cols = [col for col in merge_cols if col in df_x_clean.columns and col in df_y_clean.columns]
-                
+                        channel_df.loc[channel_df[single_feature] <= 0, single_feature] = np.nan
+
+                # Drop rows with missing feature values
+                df_x = df_x.dropna(subset=[single_feature])
+                df_y = df_y.dropna(subset=[single_feature])
+
+                merge_cols = [c for c in ['global_index', used_time_col, 'fov'] if c and c in df_x.columns and c in df_y.columns]
                 if not merge_cols:
                     print("❌ No common columns found for merging channel data")
                     return {}
-                
-                # Merge the two channel datasets - pandas will add _x and _y suffixes to distinguish columns
-                final_df = pd.merge(df_x_clean, df_y_clean, on=merge_cols, how='inner')
-                
+
+                final_df = pd.merge(df_x, df_y, on=merge_cols, suffixes=("_x", "_y"), how='inner')
                 if final_df.empty:
                     print(f"❌ No matching data points between channels {x_channel} and {y_channel}")
                     return {}
-                
-                print(f"🔍 Channel comparison: {len(final_df)} data points with both channels")
-                print(f"   X channel {x_channel}: {len(df_x_clean)} points")
-                print(f"   Y channel {y_channel}: {len(df_y_clean)} points")
-                print(f"   Overlapping: {len(final_df)} points")
-                
+
         except Exception as e:
             print(f"❌ Error preparing data: {str(e)}")
             return {}
 
-        # Clustering with error handling
+        # Clustering (operate on a reduced array)
         try:
             if run_clustering:
                 if comparison_mode == 'features':
                     clustering_data = final_df[[x_feature, y_feature]].dropna()
-                else:  # channels - use the suffixed column names after merge
+                else:
                     clustering_data = final_df[[f"{single_feature}_x", f"{single_feature}_y"]].dropna()
-                
+
                 if len(clustering_data) >= min_samples:
                     clustering = DBSCAN(eps=eps, min_samples=min_samples)
-                    cluster_labels = clustering.fit_predict(clustering_data)
-                    
-                    n_clusters = len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)
-                    n_noise = list(cluster_labels).count(-1)
-                    
+                    cluster_labels = clustering.fit_predict(clustering_data.values)
+                    final_df = final_df.loc[clustering_data.index].copy()
                     final_df['cluster'] = cluster_labels.astype(str)
                     final_df.loc[final_df['cluster'] == '-1', 'cluster'] = 'noise'
+                    n_clusters = len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)
+                    n_noise = list(cluster_labels).count(-1)
                     print(f"🎯 Clustering results: {n_clusters} clusters, {n_noise} noise points")
                 else:
-                    print(f"⚠️ Warning: Not enough data points ({len(clustering_data)}) for clustering (min_samples={min_samples})")
-                    print("🔄 Disabling clustering")
                     final_df['cluster'] = "0"
+                    print(f"⚠️ Not enough points for clustering ({len(clustering_data)}). Using single cluster.")
             else:
                 final_df['cluster'] = "0"
-                print("🎯 Clustering disabled - all points in single group")
-                
+
         except Exception as e:
             print(f"⚠️ Warning: Error in clustering, using single cluster: {str(e)}")
             final_df['cluster'] = "0"
 
-        # Prepare plotting variables
+        # Prepare ColumnDataSource using only necessary columns to reduce memory
         try:
-            unique_clusters = sorted(final_df['cluster'].unique())
-            palette = Category10[10] * ((len(unique_clusters) // 10) + 1)
-            
-            # Create data source
-            source = ColumnDataSource(final_df)
-            
-            # Determine scales
-            x_scale = LogScale() if "ctcf" in x_feature.lower() else LinearScale()
-            y_scale = LogScale() if "ctcf" in y_feature.lower() else LinearScale()
-            
-            # Create title based on comparison mode
-            fov_label = "All" if 'All' in controls['fov'].value else ','.join(map(str, selected_fovs[:3])) + ("..." if len(selected_fovs) > 3 else "")
-            
             if comparison_mode == 'features':
-                title = f"{controls['title'].value} Seq {sequence}, Channel {channel}, FOV {fov_label}"
-            else:  # channels
-                title = f"{controls['title'].value} Seq {sequence}, FOV {fov_label} - ({single_feature})"
-            
-        except Exception as e:
-            print(f"❌ Error preparing plot variables: {str(e)}")
-            return {}
+                src_cols = ['global_index', 'fov', x_feature, y_feature, 'cluster']
+            else:
+                src_cols = ['global_index', 'fov', f"{single_feature}_x", f"{single_feature}_y", 'cluster']
 
-        # Create the plot
-        try:
-            # Create appropriate axis labels and tooltips
+            src_cols = [c for c in src_cols if c in final_df.columns]
+            source = ColumnDataSource(final_df[src_cols])
+
+            unique_clusters = sorted(final_df['cluster'].unique(), key=lambda x: str(x))
+            # ensure palette long enough
+            palette = list(Category10[10]) * ((len(unique_clusters) // 10) + 1)
+
+            # Create tooltips only for present columns
+            tooltips = [("FOV", "@fov"), ("Global Index", "@global_index"), ("Cluster", "@cluster")]
             if comparison_mode == 'features':
-                x_label = x_feature.replace("_", " ")
-                y_label = y_feature.replace("_", " ")
-                # In feature comparison mode, use original feature names
-                x_feature_display = x_feature  
-                y_feature_display = y_feature
-                tooltips = [
-                    ("FOV", "@fov"),
-                    ("Global Index", "@global_index"),
-                    (x_feature, f"@{x_feature}"),
-                    (y_feature, f"@{y_feature}"),
-                    ("Cluster", "@cluster")
-                ]
-            else:  # channels
-                x_label = f"{single_feature.replace('_', ' ')} (Channel {x_channel})"
-                y_label = f"{single_feature.replace('_', ' ')} (Channel {y_channel})"
-                
-                # In channel comparison mode, the merge adds _x and _y suffixes to feature names
-                
-                x_feature_display = f"{single_feature}_x"  # Column name after merge
-                y_feature_display = f"{single_feature}_y"  # Column name after merge
-                tooltips = [
-                    ("FOV", "@fov"),
-                    ("Global Index", "@global_index"),
-                    (f"Ch {x_channel}", f"@{x_feature_display}"),
-                    (f"Ch {y_channel}", f"@{y_feature_display}"),
-                    ("Cluster", "@cluster")
-                ]
+                tooltips.insert(2, (x_feature, f"@{x_feature}"))
+                tooltips.insert(3, (y_feature, f"@{y_feature}"))
+            else:
+                x_col = f"{single_feature}_x"
+                y_col = f"{single_feature}_y"
+                tooltips.insert(2, (f"Ch {x_channel}", f"@{x_col}"))
+                tooltips.insert(3, (f"Ch {y_channel}", f"@{y_col}"))
 
-            p = figure(
-                title=title,
-                height=700,
-                width=700,
-                tools=["pan", "wheel_zoom", "reset", "box_select", "lasso_select", "tap", "hover", "save"],
-                tooltips=tooltips,
-                x_scale=x_scale,
-                y_scale=y_scale
-            )
+            # Determine axis types (use 'log'/'linear' strings so Bokeh renders ticks correctly)
+            x_axis_type_param = 'log' if (comparison_mode == 'features' and "ctcf" in x_feature.lower()) or (comparison_mode == 'channels' and "ctcf" in single_feature.lower()) else 'linear'
+            y_axis_type_param = 'log' if (comparison_mode == 'features' and "ctcf" in y_feature.lower()) or (comparison_mode == 'channels' and "ctcf" in single_feature.lower()) else 'linear'
 
-            p.scatter(
-                x=x_feature_display if comparison_mode == 'channels' else x_feature,
-                y=y_feature_display if comparison_mode == 'channels' else y_feature,
-                source=source,
-                size=6,
-                alpha=0.7,
-                color=factor_cmap('cluster', palette=palette, factors=unique_clusters)
-            )
+            # Create title
+            fov_label = "All" if user_requested_all and (force_override or num_available <= MAX_FOVS) else (',').join(map(str, selected_fovs_display[:3])) + ("..." if len(selected_fovs_display) > 3 else "")
+            if comparison_mode == 'features':
+                title = f"{controls['title'].value} TP {sequence}, Channel {channel}, FOV {fov_label}"
+            else:
+                title = f"{controls['title'].value} TP {sequence}, FOV {fov_label} - ({single_feature.replace('_', ' ')})"
 
-            p.xaxis.axis_label = x_label
-            p.yaxis.axis_label = y_label
+            # Create figure using axis type strings so Bokeh shows log ticks/spacing
+            p = figure(title=title, height=700, width=700,
+                       tools=["pan", "wheel_zoom", "reset", "box_select", "lasso_select", "tap", "hover", "save"],
+                       tooltips=tooltips, x_axis_type=x_axis_type_param, y_axis_type=y_axis_type_param)
+
+            x_col_plot = x_feature if comparison_mode == 'features' else f"{single_feature}_x"
+            y_col_plot = y_feature if comparison_mode == 'features' else f"{single_feature}_y"
+
+            # Use factor_cmap safely; if it errors, fall back to a single color
+            try:
+                color_transform = factor_cmap('cluster', palette=palette, factors=unique_clusters)
+                p.scatter(x=x_col_plot, y=y_col_plot, source=source, size=6, alpha=0.7, color=color_transform)
+            except Exception:
+                p.scatter(x=x_col_plot, y=y_col_plot, source=source, size=6, alpha=0.7, color="navy")
+
+            p.xaxis.axis_label = (x_feature if comparison_mode == 'features' else f"{single_feature} (Ch {x_channel})").replace('_', ' ')
+            p.yaxis.axis_label = (y_feature if comparison_mode == 'features' else f"{single_feature} (Ch {y_channel})").replace('_', ' ')
             p.title.text_font_size = "16pt"
             p.title.align = "center"
             p.title.text_font_style = "bold"
-            
+
         except Exception as e:
             print(f"❌ Error creating Bokeh plot: {str(e)}")
             return {}
 
-        # Create selection interface
+        # Selection interface and saving
         try:
-            # JS textbox for copy
             bokeh_textbox = TextAreaInput(value="", rows=4, title="Selected Indices:")
             source.selected.js_on_change("indices", CustomJS(args=dict(source=source, textbox=bokeh_textbox), code="""
                 const inds = cb_obj.indices;
@@ -1536,22 +1668,9 @@ def plot_interactive_scatter(df, controls, eps=300, min_samples=5):
                 textbox.value = selected.join(",");
             """))
 
-            # Save UI
-            group_name_input = widgets.Text(
-                placeholder="Enter query name", 
-                description="Query Name:", 
-                layout=widgets.Layout(width='300px')
-            )
-            group_description_input = widgets.Textarea(
-                placeholder="Enter a short description", 
-                description="Description:", 
-                layout=widgets.Layout(width='500px')
-            )
-            python_textbox = widgets.Textarea(
-                placeholder="Paste global indices here", 
-                description="Indices:", 
-                layout=widgets.Layout(width='500px')
-            )
+            group_name_input = widgets.Text(placeholder="Enter query name", description="Query Name:", layout=widgets.Layout(width='300px'))
+            group_description_input = widgets.Textarea(placeholder="Enter a short description", description="Description:", layout=widgets.Layout(width='500px'))
+            python_textbox = widgets.Textarea(placeholder="Paste global indices here", description="Indices:", layout=widgets.Layout(width='500px'))
             save_button = widgets.Button(description="Save Query", button_style='success')
             output_area = widgets.Output()
 
@@ -1560,7 +1679,6 @@ def plot_interactive_scatter(df, controls, eps=300, min_samples=5):
             def on_save_click(b):
                 nonlocal saved_queries
                 global selected_global_indices
-
                 try:
                     name = group_name_input.value.strip()
                     desc = group_description_input.value.strip()
@@ -1571,7 +1689,7 @@ def plot_interactive_scatter(df, controls, eps=300, min_samples=5):
                             clear_output()
                             print("❌ Error: Query name is required")
                         return
-                    
+
                     if not text:
                         with output_area:
                             clear_output()
@@ -1579,27 +1697,21 @@ def plot_interactive_scatter(df, controls, eps=300, min_samples=5):
                         return
 
                     selected_global_indices = [int(i.strip()) for i in text.split(",") if i.strip().isdigit()]
-                    
                     if not selected_global_indices:
                         with output_area:
                             clear_output()
                             print("❌ Error: No valid indices found")
                         return
-                    
-                    saved_queries[name] = {
-                        'indices': selected_global_indices,
-                        'description': desc
-                    }
-                    
+
+                    saved_queries[name] = {'indices': selected_global_indices, 'description': desc}
                     with output_area:
                         clear_output()
                         print(f"✅ Saved '{name}' with {len(selected_global_indices)} indices.")
-                        
-                    # Clear the form
+
                     group_name_input.value = ""
                     group_description_input.value = ""
                     python_textbox.value = ""
-                    
+
                 except ValueError as e:
                     with output_area:
                         clear_output()
@@ -1611,22 +1723,16 @@ def plot_interactive_scatter(df, controls, eps=300, min_samples=5):
 
             save_button.on_click(on_save_click)
 
-            # Show Bokeh + save UI
+            # show plot + the bokeh textbox below it
             show(column(p, bokeh_textbox))
-            display(widgets.VBox([
-                group_name_input,
-                group_description_input,
-                python_textbox,
-                save_button,
-                output_area
-            ]))
+            display(widgets.VBox([group_name_input, group_description_input, python_textbox, save_button, output_area]))
 
             return saved_queries
-            
+
         except Exception as e:
             print(f"❌ Error creating selection interface: {str(e)}")
             return {}
-            
+
     except Exception as e:
         print(f"❌ Critical error in plot_interactive_scatter: {str(e)}")
         import traceback
@@ -1635,48 +1741,85 @@ def plot_interactive_scatter(df, controls, eps=300, min_samples=5):
 
 
 def create_scatter_controls(df, mode, sample, data_type="wells_data"):
-    """Create enhanced controls for the selected comparison mode with channel names and SaveTool"""
     
+    """
+    Create enhanced controls for the selected comparison mode with channel names and SaveTool
+
+    Adds a warning when the dataset contains many FOVs and an explicit override checkbox
+    that allows using all FOVs (unsafe). The plotting function will automatically truncate
+    to the first MAX_FOVS unless the override is enabled.
+    """
     try:
         if df is None or df.empty:
             raise ValueError("DataFrame is empty or None")
-        
+
         # Get available features and channels
-        feature_cols = [col for col in df.columns if col in PARQUET_FILES[data_type]["feature_columns"]]
+        feature_cols = [col for col in df.columns if col in sample.parquet_configs[data_type]["feature_columns"]]
+
         available_channels = sorted(df['channel_index'].unique()) if 'channel_index' in df.columns else []
-        
+
         if not feature_cols:
             raise ValueError("No feature columns found in DataFrame")
         if not available_channels:
             raise ValueError("No channel data found in DataFrame")
-        
+
         # Get channel mapping from sample
         channel_mapping = sample.channels
-        
+
         # Create channel options with both number and value (e.g., "2: CY5")
         channel_options = []
         for idx in available_channels:
             channel_name = channel_mapping.get(idx, f"Channel {idx}")
             channel_options.append((f"{idx}: {channel_name}", idx))
-        
-        # Create original controls - FOV, Sequence, and DBSCAN clustering
-        sequences = sorted(df['sequence'].unique()) if 'sequence' in df.columns else [1]
-        fov_options = ['All'] + sorted(df['fov'].unique().tolist()) if 'fov' in df.columns else ['All']
-        
+
+        # Create original controls - FOV, Time Point, and DBSCAN clustering
+        # Determine the time column: pick the first matching name from TIME_COL_NAME
+        # TIME_COL_NAME is expected to be an iterable of candidate column names
+        time_col_candidates = [c for c in TIME_COL_NAME if c in df.columns] if 'TIME_COL_NAME' in globals() else []
+        time_col = time_col_candidates[0] if time_col_candidates else None
+        if time_col is not None:
+            seq_vals = pd.Series(df[time_col]).dropna().unique().tolist()
+            try:
+                sequences = sorted(int(x) for x in seq_vals)
+            except Exception:
+                try:
+                    sequences = sorted(seq_vals)
+                except Exception:
+                    sequences = [1]
+        else:
+            sequences = [1]
+        fov_list = sorted(df['fov'].unique().tolist()) if 'fov' in df.columns else []
+        fov_options = ['All'] + fov_list
+
+        # Warning/limit info
+        MAX_FOVS = 30
+        num_fovs = len(fov_list)
+        fov_warning_html = (f"<div style='color:orange'><b>Note:</b> {num_fovs} FOVs available. "
+                            f"Plotting many FOVs (> {MAX_FOVS}) may be slow or use a lot of memory. "
+                            "You can enable 'Allow all FOVs' below to override (unsafe).</div>") if num_fovs > MAX_FOVS else (f"<div>{num_fovs} FOVs available.</div>")
+        fov_warning = widgets.HTML(value=fov_warning_html)
+
+        # Explicit override checkbox (unsafe)
+        force_full_fovs_widget = widgets.Checkbox(
+            value=False,
+            description="Allow all FOVs (may use lots of RAM)",
+            style={'description_width': 'initial'}
+        )
+
         title_widget = Text(placeholder='Enter plot title...', description='Title:', layout={'width': '400px'})
 
         sequence_widget = widgets.Dropdown(
             options=sequences,
             value=sequences[0] if sequences else None,
-            description='Sequence:',
+            description='Time Point:',
             layout={'width': '200px'}
         )
-        
+
         fov_widget = widgets.SelectMultiple(
             options=fov_options,
             value=['All'],
             description='FOV(s):',
-            layout={'width': '250px', 'height': '120px'}
+            layout={'width': '250px', 'height': '120px'},
         )
 
         run_clustering_widget = widgets.ToggleButtons(
@@ -1685,45 +1828,24 @@ def create_scatter_controls(df, mode, sample, data_type="wells_data"):
             description="Auto-Clustering:",
             style={'description_width': 'initial'}
         )
-        
+
         controls = {
             'classification_mode': mode,
             'title': title_widget,
-            'sequence': sequence_widget,
+            'time point': sequence_widget,
             'fov': fov_widget,
-            'run_clustering': run_clustering_widget
+            'run_clustering': run_clustering_widget,
+            'force_full_fovs': force_full_fovs_widget
         }
-        
+
         if mode == 'features':
-            # Feature comparison mode: X and Y are different features, single channel
-            x_feature_widget = widgets.Dropdown(
-                options=feature_cols,
-                value=feature_cols[0],
-                description='X Feature:',
-                style={'description_width': 'initial'}
-            )
-            
-            y_feature_widget = widgets.Dropdown(
-                options=feature_cols,
-                value=feature_cols[1] if len(feature_cols) > 1 else feature_cols[0],
-                description='Y Feature:',
-                style={'description_width': 'initial'}
-            )
-            
-            # Enhanced channel widget with both number and value
-            channel_widget = widgets.Dropdown(
-                options=channel_options,
-                value=available_channels[0],
-                description='Channel:',
-                style={'description_width': 'initial'}
-            )
-            
-            controls.update({
-                'x_feature': x_feature_widget,
-                'y_feature': y_feature_widget,
-                'channel': channel_widget  # This is what the plotting function expects
-            })
-            
+            x_feature_widget = widgets.Dropdown(options=feature_cols, value=feature_cols[0], description='X Feature:', style={'description_width': 'initial'})
+            y_feature_widget = widgets.Dropdown(options=feature_cols, value=feature_cols[1] if len(feature_cols) > 1 else feature_cols[0], description='Y Feature:', style={'description_width': 'initial'})
+
+            channel_widget = widgets.Dropdown(options=channel_options, value=available_channels[0], description='Channel:', style={'description_width': 'initial'})
+
+            controls.update({'x_feature': x_feature_widget, 'y_feature': y_feature_widget, 'channel': channel_widget})
+
             display(widgets.VBox([
                 widgets.HTML(f"<b>Feature Comparison Settings:</b>"),
                 x_feature_widget,
@@ -1733,40 +1855,19 @@ def create_scatter_controls(df, mode, sample, data_type="wells_data"):
                 title_widget,
                 sequence_widget,
                 fov_widget,
+                fov_warning,
+                force_full_fovs_widget,
                 run_clustering_widget
             ]))
-            
-        else:  # channels mode
-            # Channel comparison mode: select one feature, plus X and Y channels
-            feature_widget = widgets.Dropdown(
-                options=feature_cols,
-                value=feature_cols[0],
-                description='Feature:',
-                style={'description_width': 'initial'}
-            )
-            
-            # Enhanced channel widgets with both number and value
-            x_channel_widget = widgets.Dropdown(
-                options=channel_options,
-                value=available_channels[0],
-                description='X Channel:',
-                style={'description_width': 'initial'}
-            )
-            
-            y_channel_widget = widgets.Dropdown(
-                options=channel_options,
-                value=available_channels[1] if len(available_channels) > 1 else available_channels[0],
-                description='Y Channel:',
-                style={'description_width': 'initial'}
-            )
-            
-            controls.update({
-                'feature': feature_widget,
-                'x_channel': x_channel_widget,
-                'y_channel': y_channel_widget,
-                'channel': x_channel_widget  # Default to x_channel for backward compatibility
-            })
-            
+
+        else:
+            feature_widget = widgets.Dropdown(options=feature_cols, value=feature_cols[0], description='Feature:', style={'description_width': 'initial'})
+
+            x_channel_widget = widgets.Dropdown(options=channel_options, value=available_channels[0], description='X Channel:', style={'description_width': 'initial'})
+            y_channel_widget = widgets.Dropdown(options=channel_options, value=available_channels[1] if len(available_channels) > 1 else available_channels[0], description='Y Channel:', style={'description_width': 'initial'})
+
+            controls.update({'feature': feature_widget, 'x_channel': x_channel_widget, 'y_channel': y_channel_widget, 'channel': x_channel_widget})
+
             display(widgets.VBox([
                 widgets.HTML(f"<b>Channel Comparison Settings:</b>"),
                 feature_widget,
@@ -1776,11 +1877,13 @@ def create_scatter_controls(df, mode, sample, data_type="wells_data"):
                 title_widget,
                 sequence_widget,
                 fov_widget,
+                fov_warning,
+                force_full_fovs_widget,
                 run_clustering_widget
             ]))
-        
+
         return controls
-        
+
     except Exception as e:
         print(f"❌ Error creating scatter controls: {e}")
         return None
@@ -1812,7 +1915,7 @@ def plot_multi_timepoint_hist(
     selected_time_points = [0,1,2],  # List of time point values to include (e.g., [1, 3])
     channel=0,  # Channel number to filter by (e.g.,0 for Brightfield, 1 for GFP, 2 for mCherry)
     treatment='Name',  # Label for the treatment group (e.g., "EV1", "EV2", "Control")
-    time_column='sequence',  # Name of the column indicating the time point (e.g., "Hours")
+    time_column=None,  # Name of the column indicating the time point (e.g., "Hours"). If None, AUTO-detect from TIME_COL_NAME
     x_scale='log',  # Scale for the x-axis: 'symlog', 'log', or 'linear'
     linthresh=1,  # Threshold for linear scaling of the x-axis (used for symlog)
     n_bins=50,  # Number of bars in the histogram (adjust for detail)
@@ -1823,17 +1926,22 @@ def plot_multi_timepoint_hist(
     smooth=False,  # If True and outline=True, smooths the outline
     border_width=1.5,  # Thickness of the outline or CDF line
     constant_N=False,          # <<< NEW: force same N across selected time points
-    random_seed=42,            # <<< NEW: reproducible downsampling
-    hide_negative_ctcf=True    # <<< NEW: filter out negative CTCF values if True
+    random_seed=42            # <<< NEW: reproducible downsampling
 ):
     # --- Collect values per time point as Series indexed by global_index ---
     per_tp_series = {}   # time_point -> pd.Series(index=global_index, values=feature)
     Ns = {}              # time_point -> N before any downsampling
     all_data = []
 
+    # Determine time column once (prefer explicit argument, else auto-detect)
+    if time_column is None:
+        time_col_candidates = [c for c in TIME_COL_NAME if c in df.columns] if 'TIME_COL_NAME' in globals() else []
+        time_column = time_col_candidates[0] if time_col_candidates else None
+
     for time_point in selected_time_points:
         # rows for requested time & channel
-        df_tp = df[(df[time_column] == time_point) & (df['channel_index'] == channel)]
+        df_tp = df[(df[time_column] == time_point) & (df['channel_index'] == channel)] if time_column is not None else df[(df['channel_index'] == channel)]
+
         if df_tp.empty:
             print(f"Skipping time point {time_point} — channel {channel} not found.")
             per_tp_series[time_point] = None
@@ -1845,13 +1953,13 @@ def plot_multi_timepoint_hist(
         cols_present = [c for c in cols_needed if c in df_tp.columns]
         d = df_tp[cols_present].dropna(subset=[feature_name]).copy()
         
-        # Filter out negative CTCF values if requested
-        if hide_negative_ctcf and "ctcf" in feature_name.lower():
+        # ALWAYS filter out non-positive CTCF values for any CTCF feature (user requested)
+        if "ctcf" in feature_name.lower():
             original_count = len(d)
             d = d[d[feature_name] > 0].copy()
             filtered_count = len(d)
             if original_count > filtered_count:
-                print(f"Filtered out {original_count - filtered_count} negative CTCF values at time point {time_point}")
+                print(f"Filtered out {original_count - filtered_count} non-positive CTCF values at time point {time_point}")
         
         d = d.sort_values(['global_index']).drop_duplicates(subset=['global_index'])  # one row per GI at this TP
 
@@ -1921,13 +2029,14 @@ def plot_multi_timepoint_hist(
     
     # Set up the figure with only hover and zoom tools
     tools = ["hover", "box_zoom", "wheel_zoom", "pan", "reset","save"]
-    
-    # Determine scale
-    if x_scale == 'log':
-        x_scale_obj = LogScale()
-    else:
-        x_scale_obj = LinearScale()
-    
+
+    # Decide x axis type: use 'log' if requested, otherwise 'linear'.
+    x_axis_type_param = 'log' if x_scale == 'log' else 'linear'
+    if x_scale == 'symlog':
+        print("Symlog requested: Bokeh does not support symlog natively. Showing linear axis."
+              " To get symlog-like display transform your data or use a custom formatter.")
+        x_axis_type_param = 'linear'
+
     channel_name = channel_mapping.get(channel, f"Channel {channel}")
     title_suffix = " (equalized N)" if constant_N else ""
     plot_title = f"{treatment} - {channel_name} {feature_name.replace('_', ' ').title()} by Time Point{title_suffix}"
@@ -1939,7 +2048,7 @@ def plot_multi_timepoint_hist(
         width=1000,
         height=800,
         tools=tools,
-        x_scale=x_scale_obj
+        x_axis_type=x_axis_type_param,
     )
 
     # Configure hover tool to show time point information
@@ -2103,17 +2212,35 @@ def log_bins(data, n_bins=50):
 
 
 def create_multi_timepoint_hist_controls(df, sample, data_type="wells_data"):
-    """Create interactive controls for multi-timepoint histogram plotting with enhanced button behavior."""
+    """Create interactive controls for multi-timepoint histogram plotting with enhanced button behavior.
+
+    Note:
+    - CTCF features are always filtered to positive values internally; the related widget was removed.
+    """
     try:
         # Get available features from the data
-        available_features = [col for col in df.columns if col in PARQUET_FILES[data_type]["feature_columns"]]
+        available_features = [col for col in df.columns if col in sample.parquet_configs[data_type]["feature_columns"]]
         if not available_features:
             print("❌ No feature columns available in the data")
             return
         
         # Get available channels and time points
+        # Determine the time column: pick the first matching name from TIME_COL_NAME
+        # TIME_COL_NAME is expected to be an iterable of candidate column names
+        time_col_candidates = [c for c in TIME_COL_NAME if c in df.columns] if 'TIME_COL_NAME' in globals() else []
+        time_col = time_col_candidates[0] if time_col_candidates else None
         available_channel_indices = sorted(df['channel_index'].unique()) if 'channel_index' in df.columns else []
-        available_sequences = sorted(df['sequence'].unique()) if 'sequence' in df.columns else [0, 1, 2, 3, 4, 5]
+        if time_col is not None:
+            seq_vals = pd.Series(df[time_col]).dropna().unique().tolist()
+            try:
+                available_sequences = sorted(int(x) for x in seq_vals)
+            except Exception:
+                try:
+                    available_sequences = sorted(seq_vals)
+                except Exception:
+                    available_sequences = [0, 1, 2, 3, 4, 5]
+        else:
+            available_sequences = [0, 1, 2, 3, 4, 5]
         channel_mapping = sample.channels
         
         # Create channel options with names
@@ -2123,7 +2250,7 @@ def create_multi_timepoint_hist_controls(df, sample, data_type="wells_data"):
             channel_options.append((f"{idx}: {channel_name}", idx))
             
         # Create sequence options
-        sequence_options = [(f"Sequence {seq}", seq) for seq in available_sequences]
+        sequence_options = [(f"Time Point {seq}", seq) for seq in available_sequences]
         
         # Create widgets
         feature_widget = widgets.Dropdown(
@@ -2158,17 +2285,10 @@ def create_multi_timepoint_hist_controls(df, sample, data_type="wells_data"):
         )
         
         x_scale_widget = widgets.ToggleButtons(
-            options=[('Linear', 'linear'), ('Log', 'log'), ('SymLog', 'symlog')],
+            options=[('Linear', 'linear'), ('Log', 'log')],
             value='log',
             description='X Scale:',
-            style={'description_width': 'initial'}
-        )
-        
-        linthresh_widget = widgets.FloatText(
-            value=1.0,
-            description='LinThresh:',
             style={'description_width': 'initial'},
-            layout=widgets.Layout(width='200px')
         )
         
         n_bins_widget = widgets.IntSlider(
@@ -2215,12 +2335,6 @@ def create_multi_timepoint_hist_controls(df, sample, data_type="wells_data"):
             style={'description_width': 'initial'}
         )
         
-        hide_negative_ctcf_widget = widgets.Checkbox(
-            value=True,
-            description='Show Positive CTCF only',
-            style={'description_width': 'initial'}
-        )
-        
         border_width_widget = widgets.FloatSlider(
             value=1.5,
             min=0.5,
@@ -2240,19 +2354,12 @@ def create_multi_timepoint_hist_controls(df, sample, data_type="wells_data"):
             style={'description_width': 'initial'},
             layout=widgets.Layout(width='300px')
         )
-        
-        # Show/hide linthresh widget based on x_scale selection
-        def update_linthresh_visibility(change):
-            linthresh_widget.layout.display = 'block' if change['new'] == 'symlog' else 'none'
-        
-        x_scale_widget.observe(update_linthresh_visibility, names='value')
-        linthresh_widget.layout.display = 'block' if x_scale_widget.value == 'symlog' else 'none'
-        
+
         # Changed button text and behavior - only save parameters, no auto-plot
         save_button = widgets.Button(
             description='💾 Save Parameters',
             button_style='success',
-            layout=widgets.Layout(width='200px', height='40px')
+            layout=widgets.Layout(width='200px', height='40px'),
         )
         
         output_area = widgets.Output()
@@ -2267,14 +2374,12 @@ def create_multi_timepoint_hist_controls(df, sample, data_type="wells_data"):
                 selected_time_points = list(time_points_widget.value)
                 selected_treatment = treatment_widget.value
                 selected_x_scale = x_scale_widget.value
-                selected_linthresh = linthresh_widget.value
                 selected_n_bins = n_bins_widget.value
                 selected_alpha = alpha_widget.value
                 selected_cumulative = cumulative_widget.value
                 selected_outline = outline_widget.value
                 selected_smooth = smooth_widget.value
                 selected_constant_n = constant_n_widget.value
-                selected_hide_negative = hide_negative_ctcf_widget.value
                 selected_border_width = border_width_widget.value
                 selected_font_size = font_size_widget.value
                 
@@ -2291,12 +2396,10 @@ def create_multi_timepoint_hist_controls(df, sample, data_type="wells_data"):
                 print(f"   Time Points: {[int(tp) for tp in selected_time_points]}")
                 print(f"   Name: {selected_treatment}")
                 print(f"   X Scale: {selected_x_scale}")
-                if selected_x_scale == 'symlog':
-                    print(f"   LinThresh: {selected_linthresh}")
                 print(f"   N Bins: {selected_n_bins}")
                 print(f"   Alpha: {selected_alpha}")
                 print(f"   Options: Cumulative={selected_cumulative}, Outline={selected_outline}, Smooth={selected_smooth}")
-                print(f"   Advanced: Constant N={selected_constant_n}, Show Positive CTCF Only={selected_hide_negative}")
+                print(f"   Advanced: Constant N={selected_constant_n}")
                 print(f"   Border Width: {selected_border_width}, Font Size: {selected_font_size}")
                 print(f"✅ Use the next cell to generate the plot with these parameters.")
         
@@ -2317,7 +2420,6 @@ def create_multi_timepoint_hist_controls(df, sample, data_type="wells_data"):
                 widgets.VBox([
                     widgets.HTML("<b>Scale & Bins:</b>"),
                     x_scale_widget,
-                    linthresh_widget,
                     n_bins_widget,
                     alpha_widget,
                     border_width_widget,
@@ -2328,8 +2430,7 @@ def create_multi_timepoint_hist_controls(df, sample, data_type="wells_data"):
                     cumulative_widget,
                     outline_widget,
                     smooth_widget,
-                    constant_n_widget,
-                    hide_negative_ctcf_widget
+                    constant_n_widget
                 ])
             ]),
             save_button,
@@ -2344,14 +2445,12 @@ def create_multi_timepoint_hist_controls(df, sample, data_type="wells_data"):
         controls_layout.time_points_widget = time_points_widget
         controls_layout.treatment_widget = treatment_widget
         controls_layout.x_scale_widget = x_scale_widget
-        controls_layout.linthresh_widget = linthresh_widget
         controls_layout.n_bins_widget = n_bins_widget
         controls_layout.alpha_widget = alpha_widget
         controls_layout.cumulative_widget = cumulative_widget
         controls_layout.outline_widget = outline_widget
         controls_layout.smooth_widget = smooth_widget
         controls_layout.constant_n_widget = constant_n_widget
-        controls_layout.hide_negative_ctcf_widget = hide_negative_ctcf_widget
         controls_layout.border_width_widget = border_width_widget
         controls_layout.font_size_widget = font_size_widget
         controls_layout.output_area = output_area
@@ -2376,9 +2475,9 @@ def plot_histogram_from_controls(filtered_df, sample, controls_layout):
             selected_time_points=list(controls_layout.time_points_widget.value),
             channel=controls_layout.channel_widget.value,
             treatment=controls_layout.treatment_widget.value,
-            time_column='sequence',
+            time_column=None,
             x_scale=controls_layout.x_scale_widget.value,
-            linthresh=controls_layout.linthresh_widget.value,
+            linthresh=1,
             n_bins=controls_layout.n_bins_widget.value,
             font_size=controls_layout.font_size_widget.value,
             alpha=controls_layout.alpha_widget.value,
@@ -2388,7 +2487,6 @@ def plot_histogram_from_controls(filtered_df, sample, controls_layout):
             border_width=controls_layout.border_width_widget.value,
             constant_N=controls_layout.constant_n_widget.value,
             random_seed=42,
-            hide_negative_ctcf=controls_layout.hide_negative_ctcf_widget.value
         )
     else:
         print("❌ Histogram controls not found. Please run the histogram controls cell above first.")
@@ -2398,7 +2496,7 @@ def create_time_series_controls(df, sample, data_type="wells_data"):
     """Create interactive controls for time series plotting with enhanced button behavior."""
     try:
         # Get available features from the data
-        available_features = [col for col in df.columns if col in PARQUET_FILES[data_type]["feature_columns"]]
+        available_features = [col for col in df.columns if col in sample.parquet_configs[data_type]["feature_columns"]]
         if not available_features:
             print("❌ No feature columns available in the data")
             return
@@ -2408,7 +2506,21 @@ def create_time_series_controls(df, sample, data_type="wells_data"):
         channel_mapping = sample.channels
         
         # Get sequence range from data
-        available_sequences = sorted(df['sequence'].unique()) if 'sequence' in df.columns else [0, 1, 2, 3, 4, 5]
+        # Determine the time column: pick the first matching name from TIME_COL_NAME
+        # TIME_COL_NAME is expected to be an iterable of candidate column names
+        time_col_candidates = [c for c in TIME_COL_NAME if c in df.columns] if 'TIME_COL_NAME' in globals() else []
+        time_col = time_col_candidates[0] if time_col_candidates else None
+        if time_col is not None:
+            seq_vals = pd.Series(df[time_col]).dropna().unique().tolist()
+            try:
+                available_sequences = sorted(int(x) for x in seq_vals)
+            except Exception:
+                try:
+                    available_sequences = sorted(seq_vals)
+                except Exception:
+                    available_sequences = [0, 1, 2, 3, 4, 5]
+        else:
+            available_sequences = [0, 1, 2, 3, 4, 5]
         min_seq, max_seq = min(available_sequences), max(available_sequences)
         
         # Create channel options with names
@@ -2440,7 +2552,7 @@ def create_time_series_controls(df, sample, data_type="wells_data"):
             min=min_seq,
             max=max_seq,
             step=1,
-            description='Start Seq:',
+            description='Start Time Point:',
             style={'description_width': 'initial'},
             layout=widgets.Layout(width='300px')
         )
@@ -2450,7 +2562,7 @@ def create_time_series_controls(df, sample, data_type="wells_data"):
             min=min_seq,
             max=max_seq,
             step=1,
-            description='End Seq:',
+            description='End Time Point:',
             style={'description_width': 'initial'},
             layout=widgets.Layout(width='300px')
         )
@@ -2533,7 +2645,7 @@ def create_time_series_controls(df, sample, data_type="wells_data"):
                 print(f"💾 Parameters saved successfully:")
                 print(f"   Feature: {selected_feature}")
                 print(f"   Channels: {channel_names}")  # Show channel names instead of numbers
-                print(f"   Sequence Range: {selected_start_seq} - {selected_end_seq}")
+                print(f"   Time Point Range: {selected_start_seq} - {selected_end_seq}")
                 print(f"   Y Scale: {selected_y_scale}")
                 print(f"   Error Bars: {selected_error_bar} ({'shown' if show_errors else 'hidden'})")
                 print(f"   Filter Non-Positive: {filter_non_pos}")
@@ -2604,10 +2716,14 @@ def plot_feature_channels_over_time(
     """
 
     # --- Filter sequence range
-    if start_sequence is not None:
-        df = df[df['sequence'] >= start_sequence]
-    if end_sequence is not None:
-        df = df[df['sequence'] <= end_sequence]
+    # Determine the time column: pick the first matching name from TIME_COL_NAME
+    # TIME_COL_NAME is expected to be an iterable of candidate column names
+    time_col_candidates = [c for c in TIME_COL_NAME if c in df.columns] if 'TIME_COL_NAME' in globals() else []
+    time_col = time_col_candidates[0] if time_col_candidates else None
+    if start_sequence is not None and time_col is not None:
+        df = df[df[time_col] >= start_sequence]
+    if end_sequence is not None and time_col is not None:
+        df = df[df[time_col] <= end_sequence]
 
     # --- Channels to use
     available_channels = sorted(df['channel_index'].dropna().unique().tolist())
@@ -2618,8 +2734,8 @@ def plot_feature_channels_over_time(
         channels = sorted(channels)
 
     # --- Prepare sequences
-    df = df.sort_values(by='sequence')
-    sequences = sorted(df['sequence'].dropna().unique().tolist())
+    df = df.sort_values(by=time_col) if time_col is not None else df
+    sequences = sorted(df[time_col].dropna().unique().tolist()) if time_col is not None else []
 
     # --- Choose a palette that won't KeyError for mid sizes
     def pick_colors(n):
@@ -2641,10 +2757,10 @@ def plot_feature_channels_over_time(
     y_axis_type = 'log' if y_scale.lower() == 'log' else 'linear'
     p = figure(
         width=950,
-        height=420,
+        height=520,
         tools=[],  # add explicitly below
         y_axis_type=y_axis_type,
-        title=f'{feature_name.replace("_", " ").title()} over sequences by channel'
+        title=f'{feature_name.replace("_", " ").title()} over time points by channel'
     )
 
     # Add standard tools
@@ -2660,7 +2776,7 @@ def plot_feature_channels_over_time(
         ch_df = df[df['channel_index'] == ch]
         # Iterate through all sequences in range so x aligns across channels
         for seq in sequences:
-            vals = ch_df.loc[ch_df['sequence'] == seq, feature_name].dropna()
+            vals = ch_df.loc[ch_df[time_col] == seq, feature_name].dropna() if time_col is not None else ch_df[feature_name].dropna()
 
             if filter_non_positive:
                 vals = vals[vals > 0]
@@ -2725,7 +2841,7 @@ def plot_feature_channels_over_time(
     hover = HoverTool(
     tooltips=[
         ('Channel', '@channel_name'),
-        ('Sequence', '@x'),
+        ('Time Point', '@x'),
         ('Mean', '@y{0.00}'),
         ('Error', '@error{0.00}')
     ],
@@ -2737,7 +2853,7 @@ def plot_feature_channels_over_time(
     p.add_tools(hover)
 
     # --- Styling
-    p.xaxis.axis_label = 'Sequence'
+    p.xaxis.axis_label = 'Time Point'
     p.yaxis.axis_label = feature_name.replace("_", " ")
     p.grid.grid_line_color = None
     p.legend.location = "top_left"

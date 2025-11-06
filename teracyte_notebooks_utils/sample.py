@@ -8,25 +8,26 @@ metadata, and storage configuration for easy access across notebooks.
 import fsspec
 import json
 import pandas as pd
+import pyarrow as pa
 import pyarrow.parquet as pq
+import re
+from collections import defaultdict
 from urllib.parse import urlparse
 from typing import Dict, Any, Optional
-from .constants import CHANNEL_NAME_DICT, PARQUET_FILES
+from .constants import CHANNEL_NAME_DICT, PARQUET_FILES, PARQUET_NON_FEATURE_COLS
 from .api_utils import *
 
 class Sample:
     """
     A class that encapsulates all sample-related data and metadata.
     
-    This class provides a single interface to access sample tokens, metadata,
+    This class provides a single interface to access sample metadata,
     storage paths, and Azure configuration for TeraCyte data analysis.
     
     Attributes:
         serial_number (str): The sample serial number
         exp_id (str): The experiment ID
         assay_id (str): The assay ID
-        sample_token (dict): Token information for data access
-        sample_datapath (str): Path to sample data
         account_name (str): Azure storage account name
         base_path (str): Base path in Azure storage
         sas (str): SAS token for Azure access
@@ -99,6 +100,181 @@ class Sample:
             # Load metadata information
             self._load_channels()
     
+    def _get_parquet_metadata(self, fs, parquet_path):
+        """
+        Get comprehensive parquet metadata including columns, rows, partitions, and partition values.
+        Efficiently extracts partition values from PyArrow metadata file paths.
+        
+        Args:
+            fs: The filesystem object
+            parquet_path (str): Path to the parquet dataset
+            
+        Returns:
+            dict: Dictionary containing columns, num_rows, partition_columns, partition_values, and custom_metadata
+        """
+        try:
+            meta_path = f"{parquet_path}/_metadata"
+            common_path = f"{parquet_path}/_common_metadata"
+            
+            # Check if _metadata file exists
+            if not fs.exists(meta_path):
+                return {
+                    "columns": [],
+                    "num_rows": 0,
+                    "partition_columns": [],
+                    "partition_values": {},
+                    "custom_metadata": {}
+                }
+            
+            # Create PyArrow filesystem wrapper and load metadata (single load)
+            pa_fs = pa.fs.PyFileSystem(pa.fs.FSSpecHandler(fs))
+            pf_meta = pq.ParquetFile(meta_path, filesystem=pa_fs)
+            md = pf_meta.metadata
+            
+            # Number of rows
+            num_rows = sum(md.row_group(i).num_rows for i in range(md.num_row_groups))
+            
+            # Column list (from _common_metadata if available, otherwise from _metadata)
+            try:
+                pf_common = pq.ParquetFile(common_path, filesystem=pa_fs)
+                schema = pf_common.schema
+            except Exception:
+                schema = pf_meta.schema
+            all_columns = schema.names
+            
+            # Load custom metadata
+            custom_metadata_path = f"{parquet_path.rstrip('/')}/custom_metadata.json"
+            if fs.exists(custom_metadata_path):
+                try:
+                    with fs.open(custom_metadata_path, 'rb') as f:
+                        custom_metadata = json.load(f)
+                except Exception:
+                    custom_metadata = {}
+            else:
+                custom_metadata = {}
+            
+            # Get expected partitions from custom metadata
+            expected_partitions = custom_metadata.get("partition_columns", None)
+            
+            # Extract partition values directly from PyArrow metadata file paths            
+            partition_values = defaultdict(set)
+            partition_cols = set()
+            
+            # Extract file paths from all row groups (using already loaded metadata)
+            paths = []
+            for i in range(md.num_row_groups):
+                rg = md.row_group(i)
+                col0 = rg.column(0)  # Any column works for file_path
+                if hasattr(col0, 'file_path') and col0.file_path:
+                    paths.append(col0.file_path)
+            
+            # Parse partition values from paths
+            for path in set(paths):  # Use set to avoid duplicates
+                for segment in path.split('/'):
+                    if '=' in segment:
+                        key, value = segment.split('=', 1)
+                        # Accept partition if it's in expected list or if we have no expected list
+                        if expected_partitions is None or key in expected_partitions:
+                            partition_cols.add(key)
+                            partition_values[key].add(value)
+            
+            # Convert to sorted lists, prioritizing expected partition order if available
+            if expected_partitions:
+                expected_found = [col for col in expected_partitions if col in partition_cols]
+                other_found = [col for col in sorted(partition_cols) if col not in expected_partitions]
+                partition_columns = expected_found + other_found
+            else:
+                partition_columns = sorted(partition_cols)
+            
+            partition_values_dict = {k: sorted(v, key=lambda x: int(x) if x.isdigit() else x) for k, v in partition_values.items()}
+            
+            for col in partition_columns:
+                values = partition_values_dict[col]
+                sample_values = values[:3] + ['...'] if len(values) > 3 else values
+            
+            # Combine data columns and partition columns for complete column list
+            all_available_columns = list(all_columns) + partition_columns
+            
+            return {
+                "columns": all_available_columns,
+                "num_rows": num_rows,
+                "partition_columns": partition_columns,
+                "partition_values": partition_values_dict,
+                "custom_metadata": custom_metadata
+            }
+            
+        except Exception as e:
+            print(f"Error getting parquet metadata: {e}")
+            return {
+                "columns": [],
+                "num_rows": 0,
+                "partition_columns": [],
+                "partition_values": {},
+                "custom_metadata": {}
+            }
+    
+
+
+
+
+    def _get_complete_parquet_metadata(self, fs, parquet_path, parquet_type, parquet_info):
+        """
+        Get complete parquet metadata combining _metadata file info and directory scanning.
+        
+        Args:
+            fs: The filesystem object
+            parquet_path (str): Path to the parquet dataset
+            parquet_type (str): The type of parquet file
+            parquet_info (dict): Info from PARQUET_FILES constants
+            
+        Returns:
+            dict: Complete metadata structure with all parquet and custom information
+        """
+        try:
+            # Start with the basic structure
+            result = {
+                "type": parquet_type,
+                "filename": parquet_info["filename"],
+                "description": parquet_info["description"],
+                "columns": [],
+                "partition_columns": [],
+                "partition_values": {},
+                "sequences": {},
+                "feature_columns": []
+            }
+            
+            # Get basic parquet metadata (includes custom metadata, extracts partitions from PyArrow metadata)
+            basic_metadata = self._get_parquet_metadata(fs, parquet_path)
+            result["columns"] = basic_metadata["columns"]
+            result["partition_columns"] = basic_metadata["partition_columns"]  
+            result["partition_values"] = basic_metadata["partition_values"]
+            result["num_rows"] = basic_metadata["num_rows"]
+            
+            # Calculate feature columns (all columns except non-feature columns)
+            all_available_columns = basic_metadata["columns"]
+            feature_columns = [col for col in all_available_columns if col not in PARQUET_NON_FEATURE_COLS]
+            result["feature_columns"] = feature_columns
+            
+            # Extract sequences and other info from custom metadata (already loaded)
+            custom_metadata = basic_metadata.get("custom_metadata", {})
+            result["sequences"] = custom_metadata.get("sequences", {})
+            
+            return result
+            
+        except Exception as e:
+            print(f"Error getting complete parquet metadata for {parquet_type}: {e}")
+            # Return minimal structure on error
+            return {
+                "type": parquet_type,
+                "filename": parquet_info["filename"],
+                "description": parquet_info["description"],
+                "columns": [],
+                "partition_columns": [],
+                "partition_values": {},
+                "sequences": {},
+                "feature_columns": []
+            }
+
     def _discover_parquet_files(self):
         """Discover and configure available parquet files for this sample."""
         try:
@@ -123,6 +299,9 @@ class Sample:
                     if fs.exists(parquet_path):
                         available_types.append(parquet_type)
                         
+                        # Get complete metadata (includes both basic parquet info and directory scanning)
+                        complete_metadata = self._get_complete_parquet_metadata(fs, parquet_path, parquet_type, parquet_info)
+                        
                         # Configure this parquet type
                         configs[parquet_type] = {
                             "type": parquet_type,
@@ -130,8 +309,12 @@ class Sample:
                             "description": parquet_info["description"],
                             "path": parquet_path,
                             "url": f"https://{self._account_name}.blob.core.windows.net/{parquet_path}?{self._sas}",
-                            "query_columns": parquet_info["query_columns"],
-                            "metadata": None  # Will be loaded later if needed
+                            "feature_columns": complete_metadata.get("feature_columns", []),
+                            "columns": complete_metadata["columns"],
+                            "num_rows": complete_metadata.get("num_rows", 0),
+                            "partition_columns": complete_metadata["partition_columns"],
+                            "partition_values": complete_metadata["partition_values"],
+                            "sequences": complete_metadata.get("sequences", {})
                         }
                                                 
                 except Exception as e:
@@ -145,111 +328,7 @@ class Sample:
             print(f"Error discovering parquet files: {e}")
             self._available_parquet_types = []
             self._parquet_configs = {}
-            
-    def _load_parquet_metadata_for_type(self, parquet_type: str) -> Dict[str, Any]:
-        """
-        Load metadata for a specific parquet file type.
-        
-        Args:
-            parquet_type (str): The type of parquet file (e.g., 'wells_data', 'cells_data', 'colocalization')
-            
-        Returns:
-            dict: Metadata information for the specified parquet type
-        """
-        try:
-            if parquet_type not in self._parquet_configs:
-                return {"error": f"Parquet type '{parquet_type}' not available"}
-                
-            config = self._parquet_configs[parquet_type]
-            parquet_path = config["path"]
-            
-            if not self._account_name or not self._sas:
-                return {"error": "Missing Azure configuration"}
-                
-            fs = fsspec.filesystem("az", account_name=self._account_name, sas_token=self._sas)
-            
-            result = {
-                "type": parquet_type,
-                "filename": config["filename"],
-                "description": config["description"],
-                "columns": [],
-                "partition_columns": [],
-                "partition_values": {},
-                "sequences": {},
-                "assay_id": None,
-                "query_columns": config["query_columns"]
-            }
 
-            # Try to read _metadata file first
-            metadata_path = f"{parquet_path.rstrip('/')}/_metadata"
-            if fs.exists(metadata_path):
-                try:
-                    with fs.open(metadata_path, 'rb') as f:
-                        metadata_obj = pq.read_metadata(f)
-                        schema = metadata_obj.schema.to_arrow_schema()
-                        
-                        # Get column names
-                        result["columns"] = schema.names
-                            
-                except Exception as e:
-                    print(f"Error reading _metadata for {parquet_type}: {e}")
-            
-            # Extract custom metadata
-            custom_metadata_path = f"{parquet_path.rstrip('/')}/custom_metadata.json"
-            if fs.exists(custom_metadata_path):
-                try:
-                    with fs.open(custom_metadata_path, 'rb') as f:
-                        custom_metadata = json.load(f)
-                        result["partition_columns"] = custom_metadata.get("partitions", [])
-                        result["sequences"] = custom_metadata.get("sequences", {})
-                        result["assay_id"] = custom_metadata.get("assay_id")
-                except Exception as e:
-                    print(f"Error reading custom_metadata for {parquet_type}: {e}")
-
-            # If we have partition columns, scan the file structure to get actual partition values
-            if result["partition_columns"]:
-                try:
-                    # Find all parquet files
-                    parquet_files = [
-                        path for path in fs.find(parquet_path)
-                        if path.endswith(".parquet") and "/_" not in path
-                    ]
-                    
-                    if parquet_files:
-                        # Extract partition values from file paths
-                        partition_values = {}
-                        for file_path in parquet_files:
-                            path_parts = file_path.split('/')
-                            for part in path_parts:
-                                if '=' in part:
-                                    key, value = part.split('=', 1)
-                                    if key in result["partition_columns"]:  # Only collect known partition columns
-                                        if key not in partition_values:
-                                            partition_values[key] = set()
-                                        try:
-                                            partition_values[key].add(int(value))
-                                        except ValueError:
-                                            partition_values[key].add(value)
-                        
-                        # Convert to sorted lists
-                        result["partition_values"] = {
-                            key: sorted(list(values)) 
-                            for key, values in partition_values.items()
-                        }
-                    else:
-                        print(f"No parquet files found in {parquet_path}")
-                        
-                except Exception as e:
-                    print(f"Error scanning partition values for {parquet_type}: {e}")
-            
-            # Cache the metadata in the config
-            self._parquet_configs[parquet_type]["metadata"] = result
-            
-            return result
-            
-        except Exception as e:
-            return {"error": f"Could not load metadata for {parquet_type}: {str(e)}"}
-    
     def _load_channels(self):
         """Load and cache channel display names from experiment metadata."""
         try:
@@ -296,119 +375,6 @@ class Sample:
         except Exception as e:
             print(f"Warning: Could not load channel names from metadata: {e}")
             self._channels = {}
-    
-    def get_partition_hierarchy(self, parquet_type: str = "wells_data") -> Dict[str, Any]:
-        """
-        Get the hierarchical structure of parquet partitions for a specific parquet type.
-        
-        This method analyzes the parquet file structure to understand the nested
-        partition relationships. For example, which FOVs exist in each sequence.
-        
-        Args:
-            parquet_type (str): The type of parquet file to analyze (default: "wells_data")
-        
-        Returns:
-            dict: Hierarchical partition structure
-            
-        Example:
-            >>> sample = Sample("serial", "exp", "assay")
-            >>> hierarchy = sample.get_partition_hierarchy("wells_data")
-            >>> # Result might look like:
-            >>> # {
-            >>> #   "sequence": {
-            >>> #     0: {"fov": [0, 2]},
-            >>> #     1: {"fov": [0, 5]}
-            >>> #   }
-            >>> # }
-        """
-        try:
-            # Check if the parquet type is available
-            if not self.has_parquet_type(parquet_type):
-                return {"error": f"Parquet type '{parquet_type}' not available"}
-            
-            parquet_path = self.get_parquet_path(parquet_type)
-            if not parquet_path or not self._account_name or not self._sas:
-                return {"error": "Missing Azure configuration"}
-            
-            fs = fsspec.filesystem("az", account_name=self._account_name, sas_token=self._sas)
-            
-            # Find all parquet files
-            parquet_files = [
-                path for path in fs.find(parquet_path)
-                if path.endswith(".parquet") and "/_" not in path
-            ]
-            
-            if not parquet_files:
-                return {"error": f"No parquet files found for {parquet_type}"}
-            
-            # Get partition columns from metadata
-            metadata = self.get_parquet_metadata(parquet_type)
-            partition_columns = metadata.get("partition_columns", [])
-            
-            if not partition_columns:
-                return {"message": f"No partition columns found for {parquet_type}"}
-            
-            # Build hierarchy structure
-            hierarchy = {}
-            
-            for file_path in parquet_files:
-                # Extract partition values from file path
-                path_parts = file_path.split('/')
-                partition_values = {}
-                
-                for part in path_parts:
-                    if '=' in part:
-                        key, value = part.split('=', 1)
-                        if key in partition_columns:
-                            try:
-                                partition_values[key] = int(value)
-                            except ValueError:
-                                partition_values[key] = value
-                
-                # Build nested structure based on partition column order
-                current_level = hierarchy
-                
-                for i, column in enumerate(partition_columns):
-                    if column in partition_values:
-                        value = partition_values[column]
-                        
-                        if i == 0:  # First level (e.g., sequence)
-                            if column not in current_level:
-                                current_level[column] = {}
-                            if value not in current_level[column]:
-                                current_level[column][value] = {}
-                            current_level = current_level[column][value]
-                        
-                        else:  # Subsequent levels (e.g., fov)
-                            if column not in current_level:
-                                current_level[column] = set()
-                            current_level[column].add(value)
-            
-            # Convert sets to sorted lists for consistent output
-            def convert_sets_to_lists(obj):
-                if isinstance(obj, dict):
-                    return {k: convert_sets_to_lists(v) for k, v in obj.items()}
-                elif isinstance(obj, set):
-                    return sorted(list(obj))
-                else:
-                    return obj
-            
-            hierarchy = convert_sets_to_lists(hierarchy)
-            
-            return hierarchy
-            
-        except Exception as e:
-            return {"error": f"Could not build partition hierarchy for {parquet_type}: {str(e)}"}
-        
-    @property
-    def sample_token(self) -> Dict[str, Any]:
-        """Get the sample token."""
-        return self._sample_token or {}
-    
-    @property
-    def sample_datapath(self) -> str:
-        """Get the sample datapath."""
-        return self._sample_datapath or ""
     
     @property
     def account_name(self) -> str:
@@ -468,50 +434,12 @@ class Sample:
     @property
     def parquet_configs(self) -> Dict[str, Dict[str, Any]]:
         """
-        Get configurations for all available parquet files.
+        Get metadata for all available parquet files.
         
         Returns:
-            dict: Dictionary mapping parquet type to its configuration
+            dict: Dictionary mapping parquet type to its metadata
         """
         return self._parquet_configs or {}
-    
-    def get_parquet_config(self, parquet_type: str) -> Dict[str, Any]:
-        """
-        Get configuration for a specific parquet file type.
-        
-        Args:
-            parquet_type (str): The type of parquet file
-            
-        Returns:
-            dict: Configuration for the specified parquet type, or empty dict if not found
-        """
-        return self._parquet_configs.get(parquet_type, {})
-    
-    def get_parquet_url(self, parquet_type: str) -> str:
-        """
-        Get the URL for a specific parquet file type.
-        
-        Args:
-            parquet_type (str): The type of parquet file
-            
-        Returns:
-            str: Azure blob URL with SAS token, or empty string if not found
-        """
-        config = self.get_parquet_config(parquet_type)
-        return config.get("url", "")
-    
-    def get_parquet_path(self, parquet_type: str) -> str:
-        """
-        Get the path for a specific parquet file type.
-        
-        Args:
-            parquet_type (str): The type of parquet file
-            
-        Returns:
-            str: Path to the parquet file, or empty string if not found
-        """
-        config = self.get_parquet_config(parquet_type)
-        return config.get("path", "")
     
     def get_parquet_metadata(self, parquet_type: str) -> Dict[str, Any]:
         """
@@ -521,28 +449,21 @@ class Sample:
             parquet_type (str): The type of parquet file
             
         Returns:
-            dict: Metadata for the specified parquet type
+            dict: Metadata for the specified parquet type, or empty dict if not found
         """
-        config = self.get_parquet_config(parquet_type)
-        if config and config.get("metadata") is None:
-            # Load metadata if not already loaded
-            self._load_parquet_metadata_for_type(parquet_type)
-            config = self.get_parquet_config(parquet_type)  # Refresh config
-        
-        return config.get("metadata", {})
+        return self._parquet_configs.get(parquet_type, {})
     
-    def get_parquet_query_columns(self, parquet_type: str) -> list:
+    def get_parquet_config(self, parquet_type: str) -> Dict[str, Any]:
         """
-        Get query columns for a specific parquet file type.
+        DEPRECATED: Use get_parquet_metadata() instead.
         
         Args:
             parquet_type (str): The type of parquet file
             
         Returns:
-            list: List of column names for querying
+            dict: Metadata for the specified parquet type, or empty dict if not found
         """
-        config = self.get_parquet_config(parquet_type)
-        return config.get("query_columns", [])
+        return self.get_parquet_metadata(parquet_type)
     
     def has_parquet_type(self, parquet_type: str) -> bool:
         """
@@ -581,8 +502,12 @@ class Sample:
             if is_available:
                 try:
                     metadata = self.get_parquet_metadata(parquet_type)
-                    if metadata and "error" not in metadata:
-                        summary[parquet_type]["metadata"] = metadata
+                    if metadata:
+                        # Include key metadata fields in summary
+                        summary[parquet_type]["columns"] = metadata.get("columns", [])
+                        summary[parquet_type]["num_rows"] = metadata.get("num_rows", 0)
+                        summary[parquet_type]["partition_columns"] = metadata.get("partition_columns", [])
+                        summary[parquet_type]["sequences"] = metadata.get("sequences", {})
                 except Exception:
                     # Metadata loading failed, but file is still available
                     pass
@@ -629,33 +554,6 @@ class Sample:
         self._initialize_dataframes_dict()
         return self._dataframes.get(parquet_type, pd.DataFrame())
     
-    def get_dataframe_filters(self, parquet_type: str) -> Dict[str, Any]:
-        """
-        Get the filters used for a specific parquet type DataFrame.
-        
-        Args:
-            parquet_type (str): The parquet type
-            
-        Returns:
-            dict: The filters used for this DataFrame
-        """
-        self._initialize_dataframes_dict()
-        return self._dataframe_filters.get(parquet_type, {})
-    
-    def is_dataframe_loaded(self, parquet_type: str) -> bool:
-        """
-        Check if a DataFrame is loaded (non-empty) for a specific parquet type.
-        
-        Args:
-            parquet_type (str): The parquet type to check
-            
-        Returns:
-            bool: True if DataFrame is loaded and non-empty, False otherwise
-        """
-        self._initialize_dataframes_dict()
-        df = self._dataframes.get(parquet_type)
-        return df is not None and not df.empty
-    
     def clear_dataframe(self, parquet_type: str):
         """
         Clear (reset to empty) the DataFrame for a specific parquet type.
@@ -701,12 +599,6 @@ class Sample:
         
         return summary
     
-    @property
-    def all_dataframes(self) -> Dict[str, Any]:
-        """Get all loaded DataFrames as a dictionary."""
-        self._initialize_dataframes_dict()
-        return self._dataframes.copy()
-    
     def get_fov_zarr_path(self, row: str, col: str, field: str = "0") -> str:
         """
         Get the full Zarr path for a specific FOV.
@@ -744,18 +636,6 @@ class Sample:
             str: Complete Azure blob URL with SAS token
         """
         return self.zarr_url
-    
-    def get_storage_options(self) -> Dict[str, str]:
-        """
-        Get the storage options dictionary for fsspec.
-        
-        Returns:
-            dict: Storage options with account name and SAS token
-        """
-        return {
-            'account_name': self.account_name,
-            'sas_token': self.sas
-        }
     
     @property
     def wells_groups(self):
@@ -895,10 +775,6 @@ class Sample:
             summary["groups"].append(group_info)
         
         return summary
-    
-    def refresh(self):
-        """Refresh all sample data by reloading from the API."""
-        self._load_sample_data()
     
     def __repr__(self) -> str:
         """String representation of the Sample object."""

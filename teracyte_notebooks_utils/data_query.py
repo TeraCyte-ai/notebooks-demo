@@ -4,19 +4,27 @@ Data query utilities for TeraCyte data overview notebooks.
 This module provides utilities for reading experimental data.
 """
 
+# Standard library imports
+import io
+import os
+import traceback
 import warnings
-import fsspec
-import duckdb
-import pandas as pd
 from typing import Dict, Union, List
+
+# Third-party imports
+import duckdb
+import fsspec
 import ipywidgets as widgets
-from IPython.display import clear_output
+import pandas as pd
+from IPython.display import clear_output, display, HTML
+from ipywidgets import FileUpload, Button, VBox, HTML as HTMLWidget, Output
+
+# Local imports
+from .sample import Sample
+from .api_utils import get_assay_workflows
 
 # Suppress specific pandas FutureWarnings about groupby operations
 warnings.filterwarnings("ignore", message="DataFrameGroupBy.apply operated on the grouping columns", category=FutureWarning)
-
-from .sample import Sample
-from .api_utils import get_assay_workflows
 
 
 def query_filtered_parquet_from_azure(
@@ -140,8 +148,11 @@ def read_sample_parquet_data(
     if not sample.has_parquet_type(parquet_type):
         raise ValueError(f"Data type '{parquet_type}' is not available for this sample. Available types: {sample.available_parquet_types}")
     
+    metadata = sample.get_parquet_metadata(parquet_type)
+    parquet_data_path = metadata.get("path", "")
+    
     return query_filtered_parquet_from_azure(
-        parquet_data_path=sample.get_parquet_path(parquet_type),
+        parquet_data_path=parquet_data_path,
         account_name=sample.account_name,
         sas_token=sample.sas,
         filters=filters,
@@ -149,7 +160,7 @@ def read_sample_parquet_data(
     )
 
 
-def create_interactive_data_query(sample: Sample, always_checked_columns: Dict = {'fov', 'sequence', 'channel_index', 'z_index', 'global_index', 'object_id', "channel_index1", "channel_index2"}) -> widgets.VBox:
+def create_interactive_data_query(sample: Sample, always_checked_columns: Dict = {'fov', 'sequence', 'timepoint', 'channel_index', 'z_index', 'classification', 'global_index', 'object_id', 'channel_index1', 'channel_index2'}) -> widgets.VBox:
     """
     Create an interactive query builder with parquet type selection that displays results without saving to sample.
     
@@ -167,7 +178,7 @@ def create_interactive_data_query(sample: Sample, always_checked_columns: Dict =
     
     # Create parquet type selection dropdown
     parquet_type_dropdown = widgets.Dropdown(
-        options=[(f"{ptype} - {sample.get_parquet_config(ptype).get('description', 'No description')}", ptype) 
+        options=[(f"{ptype} - {sample.get_parquet_metadata(ptype).get('description', 'No description')}", ptype) 
                 for ptype in available_types],
         value=available_types[0] if available_types else None,
         description='Data type:',
@@ -185,6 +196,7 @@ def create_interactive_data_query(sample: Sample, always_checked_columns: Dict =
         'partition_widgets': {},
         'summary_area': None,
         'available_columns': [],
+        'total_rows': 0,
         'load_button': None,
         'output_area': None
     }
@@ -198,9 +210,7 @@ def create_interactive_data_query(sample: Sample, always_checked_columns: Dict =
             return error_widget
         
         # Get available columns from parquet metadata
-        available_columns = sample.get_parquet_query_columns(parquet_type)
-        if not available_columns:
-            available_columns = metadata.get('columns', [])
+        available_columns = metadata.get('columns', [])
         
         if not available_columns:
             error_widget = widgets.HTML(f"<div style='color: red;'>No column information available for {parquet_type}</div>")
@@ -208,6 +218,10 @@ def create_interactive_data_query(sample: Sample, always_checked_columns: Dict =
         
         # Store available columns for later use
         current_widgets['available_columns'] = available_columns
+        
+        # Get total number of rows from metadata
+        total_rows = metadata.get('num_rows', 0)
+        current_widgets['total_rows'] = total_rows
         
         # Get channel names from sample
         channel_names = sample.channels
@@ -412,15 +426,18 @@ def create_interactive_data_query(sample: Sample, always_checked_columns: Dict =
                 else:
                     total_combinations = 0
             
+            # Add total rows info to all summary messages
+            total_rows_info = f"<br><strong>Total rows in data file:</strong> {current_widgets['total_rows']:,}"
+            
             if total_combinations == 0:
-                summary_text = "<div style='padding: 10px; background: #fff3cd; border-radius: 5px; color: #856404;'><strong>No data will be returned</strong> - At least one value must be selected for each partition.</div>"
+                summary_text = f"<div style='padding: 10px; background: #fff3cd; border-radius: 5px; color: #856404;'><strong>No data will be returned</strong> - At least one value must be selected for each partition.{total_rows_info}</div>"
             elif selected_columns == 0:
-                summary_text = "<div style='padding: 10px; background: #fff3cd; border-radius: 5px; color: #856404;'><strong>No columns selected</strong> - At least one column must be selected.</div>"
+                summary_text = f"<div style='padding: 10px; background: #fff3cd; border-radius: 5px; color: #856404;'><strong>No columns selected</strong> - At least one column must be selected.{total_rows_info}</div>"
             elif filters:
                 filter_text = ", ".join([f"{k}: {len(v)} values" for k, v in filters.items()])
-                summary_text = f"<div style='padding: 10px; background: #e7f3ff; border-radius: 5px;'><strong>Columns:</strong> {selected_columns}/{len(current_widgets['available_columns'])}<br><strong>Filters:</strong> {filter_text}<br><strong>Estimated combinations:</strong> {total_combinations:,}</div>"
+                summary_text = f"<div style='padding: 10px; background: #e7f3ff; border-radius: 5px;'><strong>Columns:</strong> {selected_columns}/{len(current_widgets['available_columns'])}<br><strong>Filters:</strong> {filter_text}<br><strong>Estimated combinations:</strong> {total_combinations:,}{total_rows_info}</div>"
             else:
-                summary_text = f"<div style='padding: 10px; background: #fff3cd; border-radius: 5px;'><strong>Columns:</strong> {selected_columns}/{len(current_widgets['available_columns'])}<br><strong>All partitions selected</strong><br><strong>Estimated combinations:</strong> {total_combinations:,} (this may take time!)</div>"
+                summary_text = f"<div style='padding: 10px; background: #fff3cd; border-radius: 5px;'><strong>Columns:</strong> {selected_columns}/{len(current_widgets['available_columns'])}<br><strong>All partitions selected</strong><br><strong>Estimated combinations:</strong> {total_combinations:,} (this may take time!){total_rows_info}</div>"
             
             current_widgets['summary_area'].value = summary_text
         
@@ -486,7 +503,15 @@ def create_interactive_data_query(sample: Sample, always_checked_columns: Dict =
                     print("🚀 Executing DuckDB query...")
                     df = read_sample_parquet_data(sample, filters, columns=selected_columns, parquet_type=parquet_type)
                     
-                    print(f"✅ Successfully loaded {len(df)} rows")
+                    # Calculate percentage of data loaded
+                    total_rows_in_parquet = current_widgets['total_rows']
+                    loaded_rows = len(df)
+                    if total_rows_in_parquet > 0:
+                        percentage_loaded = (loaded_rows / total_rows_in_parquet) * 100
+                        print(f"✅ Successfully loaded {loaded_rows:,} rows ({percentage_loaded:.2f}% of total {total_rows_in_parquet:,} rows)")
+                    else:
+                        print(f"✅ Successfully loaded {loaded_rows:,} rows")
+                    
                     print(f"📊 Data shape: {df.shape}")
                     print(f"🗂️  Columns: {list(df.columns)}")
                     
@@ -497,7 +522,6 @@ def create_interactive_data_query(sample: Sample, always_checked_columns: Dict =
                                         
                 except Exception as e:
                     print(f"❌ Error loading data: {str(e)}")
-                    import traceback
                     traceback.print_exc()
             
             # Update dataframe status display (outside the output area)
@@ -720,3 +744,163 @@ def get_assay_workflows_status(assay_id: str) -> pd.DataFrame:
         workflows_df = workflows_df.groupby(['seq_num', 'fov_num', 'workflow_name']).apply(get_best_workflow, include_groups=True).reset_index(drop=True)
     
     return workflows_df
+
+
+def upload_csv_data():
+    """
+    Creates an interactive file upload interface that works in both VS Code and Google Colab.
+    
+    Returns:
+        pandas.DataFrame: The uploaded CSV data, or None if no file is selected/uploaded.
+        
+    Usage:
+        data = upload_csv_data()
+        if data is not None:
+            print(f"Loaded {len(data)} rows")
+    """
+    # Check if we're in Google Colab
+    try:
+        import google.colab
+        in_colab = True
+    except ImportError:
+        in_colab = False
+    
+    # Storage for the uploaded data
+    uploaded_data = {'df': None}
+    
+    if in_colab:
+        # Google Colab implementation
+        def upload_colab():
+            from google.colab import files
+            print("📁 Select your CSV file:")
+            uploaded = files.upload()
+            
+            if uploaded:
+                filename = list(uploaded.keys())[0]
+                try:
+                    df = pd.read_csv(filename)
+                    uploaded_data['df'] = df
+                    print(f"✅ Successfully loaded {len(df)} rows from {filename}")
+                    print(f"Columns: {list(df.columns)}")
+                    return df
+                except Exception as e:
+                    print(f"❌ Error loading CSV: {str(e)}")
+                    return None
+            else:
+                print("❌ No file selected")
+                return None
+                
+        return upload_colab()
+        
+    else:
+        # VS Code/Jupyter implementation with file upload widget
+        output = Output()
+        
+        # Create file upload widget
+        file_upload = FileUpload(
+            accept='.csv',
+            multiple=False,
+            description='Upload CSV File',
+        )
+        
+        # Status display
+        status_html = HTMLWidget(
+            value="<div style='padding: 10px; font-size: 14px;'>📁 Select a CSV file to upload</div>"
+        )
+        
+        def on_upload_change(change):
+            """Handle file upload"""
+            with output:
+                output.clear_output(wait=True)
+                
+                if file_upload.value:
+                    try:
+                        # Handle different possible structures of file_upload.value
+                        files = file_upload.value
+                        
+                        if isinstance(files, (tuple, list)) and len(files) > 0:
+                            # Files is a tuple/list of file dictionaries
+                            file_info = files[0]
+                            filename = file_info['name']
+                            content = file_info['content']
+                        elif isinstance(files, dict):
+                            # Files is a single dictionary (alternative structure)
+                            filename = files['name']
+                            content = files['content']
+                        else:
+                            raise ValueError("Unexpected file upload structure")
+                        
+                        # Read the CSV data
+                        df = pd.read_csv(io.BytesIO(content))
+                        uploaded_data['df'] = df
+                        
+                        # Update status
+                        status_html.value = f"""
+                        <div style='padding: 10px; background-color: #d4edda; border: 1px solid #c3e6cb; border-radius: 5px; color: #155724;'>
+                            ✅ Successfully loaded <strong>{len(df)} rows</strong> from <strong>{filename}</strong><br>
+                            📊 Columns ({len(df.columns)}): {', '.join(list(df.columns)[:5])}{'...' if len(df.columns) > 5 else ''}
+                        </div>
+                        """
+                                                
+                    except Exception as e:
+                        status_html.value = f"""
+                        <div style='padding: 10px; background-color: #f8d7da; border: 1px solid #f5c6cb; border-radius: 5px; color: #721c24;'>
+                            ❌ Error loading CSV: {str(e)}
+                        </div>
+                        """
+                        print(f"Error: {str(e)}")
+                else:
+                    status_html.value = "<div style='padding: 10px; font-size: 14px;'>📁 Select a CSV file to upload</div>"
+        
+        # Connect the upload handler
+        file_upload.observe(on_upload_change, names='value')
+        
+        # Create the UI layout        
+        ui = VBox([
+            file_upload,
+            status_html,
+            output
+        ])
+        
+        # Display the interface
+        display(ui)
+        
+        # Return a function to get the data when called
+        def get_uploaded_data():
+            return uploaded_data['df']
+        
+        # Store reference for access
+        upload_csv_data._get_data = get_uploaded_data
+        
+        # Return the current data (None initially)
+        return uploaded_data['df']
+
+
+def get_uploaded_data():
+    """
+    Get the last uploaded CSV data from upload_csv_data() without any display output.
+    
+    Returns:
+        pandas.DataFrame or None: The uploaded data if available, None otherwise
+    """
+    if hasattr(upload_csv_data, '_get_data'):
+        return upload_csv_data._get_data()
+    return None
+
+
+def display_uploaded_data():
+    """
+    Display information about the last uploaded CSV data from upload_csv_data().
+    
+    Returns:
+        pandas.DataFrame or None: The uploaded data if available, None otherwise
+    """
+    data = get_uploaded_data()
+    
+    if data is not None:
+        print(f"📊 Previously uploaded data: {data.shape}")
+        print(f"Columns: {list(data.columns)}")
+    else:
+        print("ℹ️ No data has been uploaded yet. Use upload_csv_data() first.")
+    
+    return data

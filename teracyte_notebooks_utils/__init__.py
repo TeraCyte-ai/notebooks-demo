@@ -9,7 +9,9 @@ from .sample import Sample
 from .constants import (
     CHANNEL_NAME_DICT,
     CHANNEL_COLORS_DICT,
-    PARQUET_FILES
+    PARQUET_FILES,
+    PARQUET_NON_FEATURE_COLS,
+    MAGNIFICATION_GRID_CONFIG
 )
 from .config import (
     set_service_ip,
@@ -31,7 +33,7 @@ from .api_utils import (
 from .metadata_display import (
     display_hardware_metadata,
     display_sample_metadata,
-    display_parquet_data_progress
+    display_serial_number_records
 )
 from .vizarr_viewer import (
     create_fovs_vizarr_viewer
@@ -41,6 +43,8 @@ from .data_query import (
     read_sample_parquet_data,
     create_interactive_data_query,
     download_query_data_csv,
+    upload_csv_data,
+    get_uploaded_data,
     get_assay_workflows_status,
 )
 from .analysis_plots import (
@@ -72,6 +76,11 @@ from .groups_manager import (
     filter_valid_groups,
     format_group_option
 )
+from .system_utils import (
+    monitor_resources,
+    get_memory_info,
+    stop_if_memory_high
+)
 
 __version__ = "0.2.0"
 
@@ -80,9 +89,9 @@ __all__ = [
     # Constants
     "CHANNEL_NAME_DICT",
     "CHANNEL_COLORS_DICT", 
-    "PARQUET_FILENAME",
-    "PARQUET_QUERY_COLUMNS",
-    "PARQUET_FEATURE_COLUMNS",
+    "PARQUET_FILES",
+    "PARQUET_NON_FEATURE_COLS",
+    "MAGNIFICATION_GRID_CONFIG",
     # API utilities
     "get_experiment_metadata", 
     "get_sample_metadata",
@@ -95,8 +104,8 @@ __all__ = [
     "get_assay_workflows",
     # Metadata display
     "display_hardware_metadata",
-    "display_sample_metadata", 
-    "display_parquet_data_progress",
+    "display_sample_metadata",
+    "display_serial_number_records",
     # Vizarr viewer
     "create_fovs_vizarr_viewer",
     # Data query
@@ -105,6 +114,8 @@ __all__ = [
     "create_interactive_data_query",
     "download_query_data_csv",
     "get_assay_workflows_status",
+    "upload_csv_data",
+    "get_uploaded_data",
     # Analysis plots
     "parquet_seq_fov_heatmaps",
     "create_workflow_selector",
@@ -131,5 +142,9 @@ __all__ = [
     # Wells groups manager
     "create_wells_groups_manager",
     "filter_valid_groups",
-    "format_group_option"
+    "format_group_option",
+    # System utilities
+    "monitor_resources",
+    "get_memory_info",
+    "stop_if_memory_high"
 ]
