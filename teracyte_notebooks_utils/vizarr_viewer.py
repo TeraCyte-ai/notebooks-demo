@@ -14,7 +14,7 @@ from IPython.display import HTML, IFrame, clear_output, display
 
 from .sample import Sample
 from .constants import MAGNIFICATION_GRID_CONFIG
-
+from .api_utils import get_vizarr_url
 
 def create_fovs_vizarr_viewer(sample: Sample) -> widgets.Widget:
     """
@@ -72,7 +72,7 @@ def create_fovs_vizarr_viewer(sample: Sample) -> widgets.Widget:
 
                 # Create the Vizarr URL with the source
                 vizarr_url = (
-                    f"https://green-wave-0a25ef503.1.azurestaticapps.net/"
+                    f"{get_vizarr_url()}/"
                     f"?source={urllib.parse.quote(source_url)}"
                     f"&uiState=open&viewPosition=200,0?debug=true&t=123456789"
                 )
@@ -101,7 +101,7 @@ def create_fovs_vizarr_viewer(sample: Sample) -> widgets.Widget:
 
                 # Create the Vizarr URL with the source to view the entire plate
                 vizarr_url = (
-                    f"https://green-wave-0a25ef503.1.azurestaticapps.net/"
+                    f"{get_vizarr_url()}/"
                     f"?source={urllib.parse.quote(source_url)}&uiState=open"
                 )
 
