@@ -10,6 +10,7 @@ import os
 import traceback
 import warnings
 from typing import Dict, Union, List
+import json
 
 # Third-party imports
 import duckdb
@@ -688,6 +689,34 @@ def get_assay_workflows_status(assay_id: str) -> pd.DataFrame:
     Handles duplicates by returning the last successful workflow for each combination 
     of seq_num, fov_num, and workflow_name, or the last one if all failed.
     """
+    
+    def parse_critical_steps(critical_steps_json, value):
+        """
+        Parse the critical_steps JSON string to extract the  value.
+        """
+        try:
+            if pd.isna(critical_steps_json):
+                return None
+            parsed_data = json.loads(critical_steps_json)
+            return parsed_data.get(value)
+        
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            return None
+
+    def parse_steps_to_status(steps_dict):
+        """
+        Parse steps details dictionary to extract just step name and success/failure status.
+        """
+        if not steps_dict or pd.isna(steps_dict):
+            return {}
+        result = {}
+        for step_name, step_info in steps_dict.items():
+            if isinstance(step_info, dict) and 'phase' in step_info:
+                result[step_name] = step_info['phase']
+            else:
+                result[step_name] = 'Unknown'
+        return result
+
     workflows = get_assay_workflows(assay_id)
     workflows = workflows.get("workflows")
     if not workflows:
@@ -700,6 +729,12 @@ def get_assay_workflows_status(assay_id: str) -> pd.DataFrame:
         flattened_data.append(combined)
 
     workflows_df = pd.DataFrame(flattened_data)
+
+    workflows_df['critical_status'] = workflows_df['critical_steps'].apply(lambda x: parse_critical_steps(x, 'critical_status'))
+    workflows_df.loc[workflows_df['critical_status'] == 'partial', 'phase'] = 'Partial'
+    workflows_df['steps_details'] = workflows_df['critical_steps'].apply(lambda x: parse_critical_steps(x, 'critical_steps_details'))
+    workflows_df['steps_status'] = workflows_df['steps_details'].apply(parse_steps_to_status)
+    
     workflows_df = workflows_df[~workflows_df['workflow_name'].isin(['create-assay', 'create-sequence'])]
     workflows_df.reset_index(drop=True, inplace=True)
     workflows_df[['steps_done', 'steps_total']] = workflows_df['progress'].str.split('/', expand=True).astype(int)
