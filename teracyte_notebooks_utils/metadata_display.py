@@ -4,6 +4,128 @@ from IPython.display import display, HTML, Markdown, clear_output
 from .sample import Sample
 from .api_utils import get_experiment_metadata, get_sample_metadata, get_user_samples
 
+def display_metadata(exp_metadata: dict, sample_metadata: dict):
+    """
+    Display selected metadata fields in a single card-style UI, with channels table at the bottom inside the same box.
+    - Holder Type
+    - Magnification (with 'x')
+    - Well Radius (diameter/2, with μm)
+    - Number of Timepoints
+    - Channels (table, inside the same card)
+    """
+    from IPython.display import display, HTML
+    holder_type = exp_metadata.get('holderType', sample_metadata.get('holderType', 'N/A'))
+    magnification = exp_metadata.get('magnification', sample_metadata.get('magnification', 'N/A'))
+    magnification_str = f"{magnification}x" if magnification != 'N/A' else 'N/A'
+    chip_diameter = sample_metadata.get('diameter', 'N/A')
+    try:
+        well_radius = float(chip_diameter) / 2
+        well_radius_str = f"{well_radius:.2f} μm"
+    except Exception:
+        well_radius_str = f"{chip_diameter} μm"
+    channels = exp_metadata.get('channels', {})
+    sequences = sample_metadata.get('sequences', [])
+    num_timepoints = len(sequences) if isinstance(sequences, list) else 'N/A'
+
+    # Prepare channel table HTML
+    channel_table_html = ''
+    if isinstance(channels, dict) and channels:
+        # Show Name (channelName), Exposure, Intensity, with capitalized headers
+        channel_table_html += '<table style="border-collapse:collapse; min-width:420px; font-size:0.97em; color:#222;">'
+        channel_table_html += '<thead><tr>'
+        channel_table_html += '<th style="border:1px solid #b3c2cc; padding:6px 10px; background:#e3eaf2; color:#222;">Index</th>'
+        channel_table_html += '<th style="border:1px solid #b3c2cc; padding:6px 10px; background:#e3eaf2; color:#222;">Name</th>'
+        channel_table_html += '<th style="border:1px solid #b3c2cc; padding:6px 10px; background:#e3eaf2; color:#222;">Exposure</th>'
+        channel_table_html += '<th style="border:1px solid #b3c2cc; padding:6px 10px; background:#e3eaf2; color:#222;">Intensity</th>'
+        channel_table_html += '</tr></thead><tbody>'
+        for idx, ch in channels.items():
+            channel_table_html += '<tr>'
+            channel_table_html += f'<td style="border:1px solid #b3c2cc; padding:6px 10px; color:#222;">{idx}</td>'
+            channel_table_html += f'<td style="border:1px solid #b3c2cc; padding:6px 10px; color:#222;">{ch.get("channelName", "")}</td>'
+            channel_table_html += f'<td style="border:1px solid #b3c2cc; padding:6px 10px; color:#222;">{ch.get("exposure", "")}</td>'
+            channel_table_html += f'<td style="border:1px solid #b3c2cc; padding:6px 10px; color:#222;">{ch.get("intensity", "")}</td>'
+            channel_table_html += '</tr>'
+        channel_table_html += '</tbody></table>'
+    else:
+        channel_table_html = f'<span style="color:#888;">No channel data available</span>'
+
+    # Card-style HTML with icons and flex layout, channels as table
+    html = f'''
+    <style>
+    .tc-meta-card {{
+        border: 1px solid #b3c2cc;
+        border-radius: 14px;
+        background: linear-gradient(135deg, #f8fafc 10%, #e3eaf2 100%);
+        padding: 24px 32px;
+        margin: 18px 0;
+        box-shadow: 0 2px 8px rgba(44,62,80,0.07);
+        display: flex;
+        flex-direction: column;
+        gap: 0px;
+        align-items: flex-start;
+        font-family: 'Segoe UI', Arial, sans-serif;
+        max-width: 1000px;
+    }}
+    .tc-meta-row {{
+        display: flex;
+        flex-direction: row;
+        gap: 36px;
+        align-items: flex-start;
+        width: 100%;
+    }}
+    .tc-meta-item {{
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        min-width: 120px;
+        gap: 6px;
+    }}
+    .tc-meta-label {{
+        font-size: 1.05em;
+        color: #2a3a4a;
+        font-weight: 700;
+        margin-bottom: 2px;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+    }}
+    .tc-meta-value {{
+        font-size: 0.92em;
+        color: #1a2a3a;
+        font-weight: 600;
+    }}
+    .tc-meta-channels-table {{
+        margin-top: 8px;
+        margin-bottom: 2px;
+    }}
+    </style>
+    <div class="tc-meta-card">
+        <div class="tc-meta-row">
+            <div class="tc-meta-item">
+                <span class="tc-meta-label">🔲 Holder Type</span>
+                <span class="tc-meta-value">{holder_type}</span>
+            </div>
+            <div class="tc-meta-item">
+                <span class="tc-meta-label">🔬 Magnification</span>
+                <span class="tc-meta-value">{magnification_str}</span>
+            </div>
+            <div class="tc-meta-item">
+                <span class="tc-meta-label">🧫 Well Radius</span>
+                <span class="tc-meta-value">{well_radius_str}</span>
+            </div>
+            <div class="tc-meta-item">
+                <span class="tc-meta-label">⏱️ Number of Timepoints</span>
+                <span class="tc-meta-value">{num_timepoints}</span>
+            </div>
+        </div>
+        <div class="tc-meta-item" style="margin-top:32px; width:100%;">
+            <span class="tc-meta-label">🧬 Channels</span>
+            <div class="tc-meta-channels-table">{channel_table_html}</div>
+        </div>
+    </div>
+    '''
+    display(HTML(html))
+
 def display_hardware_metadata(exp_metadata: dict, sample_metadata: dict):
     # Microscope metadata
     microscope_keys = [

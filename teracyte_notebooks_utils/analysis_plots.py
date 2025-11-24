@@ -85,133 +85,151 @@ def parquet_seq_fov_heatmaps(sample: Sample, parquet_data_progress: pd.DataFrame
 
 def workflows_progress_heatmaps(sample: Sample, workflows_df: pd.DataFrame):
     """
-    Create heatmaps showing workflow progress for each sequence using matplotlib.
-    
-    Color scheme:
-    - Red: Failed
-    - Green: Succeeded  
-    - Blue: Running
-    - Yellow: Pending
-    - Grey: Not exist in table
-    """    
+    Create interactive heatmaps showing workflow progress for each sequence using Plotly.
+    Hover tooltips show workflow details for each FOV.
+    """
+    import plotly.graph_objects as go
     magnification = sample.sample_metadata.get("magnification", 10)
     grid_config = MAGNIFICATION_GRID_CONFIG.get(magnification)
     if grid_config is None:
         raise ValueError(f"Unsupported magnification value: {magnification}")
-    
     cols = grid_config["cols"]
     rows = grid_config["rows"]
     fov_count = grid_config["fov_count"]
 
     visual_grid = _create_visual_grid(rows, cols, fov_count)
     visual_grid_array = np.array(visual_grid)
-    
-    # Define color mapping - RGB values for matplotlib
+
+    # Define color mapping - Pastel colors
     phase_colors = {
-        'Failed': '#FFB3BA',      # Pastel Red
         'Succeeded': '#BAFFC9',   # Pastel Green  
-        'Running': '#BAE1FF',     # Pastel Blue
+        'Partial': '#FFD4BA',     # Pastel Orange
         'Pending': '#FFFFBA',     # Pastel Yellow
+        'Running': '#BAE1FF',     # Pastel Blue
+        'Failed': '#FFB3BA',      # Pastel Red
         'Not exist': '#D3D3D3'    # Light Grey
     }
-    
+
     # Get unique sequences
     sequences = sorted(workflows_df['seq_num'].unique()) if 'seq_num' in workflows_df.columns else [0]
-    
+
     for seq in sequences:
         # Filter workflows for this sequence
         seq_workflows = workflows_df[workflows_df['seq_num'] == seq] if 'seq_num' in workflows_df.columns else workflows_df
-        
-        # Create color matrix
-        color_matrix = np.full(visual_grid_array.shape, 'Not exist', dtype=object)
-        
+
+        # Create color and hover data matrices
+        color_matrix = np.full(visual_grid_array.shape, 5, dtype=int)  # Default to "Not exist" (5)
+        hover_text = np.full(visual_grid_array.shape, "", dtype=object)
+
         # Create lookup dictionaries for faster access
         fov_to_workflow = {}
         for _, workflow in seq_workflows.iterrows():
             fov_num = workflow['fov_num']
             fov_to_workflow[fov_num] = workflow
-        
-        # Fill the color matrix
+
+        # Fill the matrices
         for i in range(visual_grid_array.shape[0]):
             for j in range(visual_grid_array.shape[1]):
                 fov_num = int(visual_grid_array[i, j])
-                
                 if fov_num in fov_to_workflow:
                     workflow = fov_to_workflow[fov_num]
                     phase = workflow['phase']
-                    color_matrix[i, j] = phase
+                    # Map phase to color index
+                    if phase == 'Failed':
+                        color_matrix[i, j] = 0
+                    elif phase == 'Succeeded':
+                        color_matrix[i, j] = 1
+                    elif phase == 'Running':
+                        color_matrix[i, j] = 2
+                    elif phase == 'Pending':
+                        color_matrix[i, j] = 3
+                    elif phase == 'Partial':
+                        color_matrix[i, j] = 4
+                    else:
+                        color_matrix[i, j] = 5  # Not exist
+                    # Create hover text with workflow info
+                    def dict_to_indented_lines(d):
+                        if not isinstance(d, dict):
+                            return str(d)
+                        return "<br>".join([f"&nbsp;&nbsp;<b>{k}</b>: {v}" for k, v in d.items()])
+
+                    steps_status_html = dict_to_indented_lines(workflow.get('steps_status', {}))
+                    hover_text[i, j] = (
+                        f"<b>FOV {fov_num}</b><br>"
+                        f"Name: {workflow['name']}<br>"
+                        f"Phase: {phase}<br>"
+                        f"Creation: {workflow['creation_timestamp']}<br>"
+                        f"Started: {workflow['started_at']}<br>"
+                        f"Finished: {workflow['finished_at']}<br>"
+                        f"Progress: {workflow['steps_done']}/{workflow['steps_total']}<br>"
+                        f"Steps status:<br>{steps_status_html}"
+                    )
                 else:
-                    color_matrix[i, j] = 'Not exist'
-        
-        # Create the matplotlib figure
-        fig, ax = plt.subplots(figsize=(12, 8))
-        
-        # Create a custom colormap from our phase colors
-        from matplotlib.colors import ListedColormap
-        import matplotlib.patches as mpatches
-        
-        # Create color array for the heatmap
-        numeric_matrix = np.zeros(visual_grid_array.shape)
-        color_list = []
-        phase_to_num = {}
-        
-        unique_phases = list(set(color_matrix.flatten()))
-        for idx, phase in enumerate(unique_phases):
-            phase_to_num[phase] = idx
-            color_list.append(phase_colors[phase])
-        
-        # Convert phase matrix to numeric matrix
-        for i in range(color_matrix.shape[0]):
-            for j in range(color_matrix.shape[1]):
-                numeric_matrix[i, j] = phase_to_num[color_matrix[i, j]]
-        
-        # Create custom colormap
-        cmap = ListedColormap(color_list)
-        
-        # Create the heatmap
-        im = ax.imshow(numeric_matrix, cmap=cmap, aspect='equal', 
-                      vmin=0, vmax=len(unique_phases)-1)
-        
-        # Add FOV numbers as text
+                    # FOV not in workflows data
+                    hover_text[i, j] = f"<b>FOV {fov_num}</b><br>Status: Not in workflows data"
+
+        # Create the heatmap using phase_colors
+        fig = go.Figure(data=go.Heatmap(
+            z=color_matrix,
+            colorscale=[
+                [0.0, phase_colors['Failed']],     # Failed - Pastel Red
+                [0.2, phase_colors['Succeeded']], # Succeeded - Pastel Green
+                [0.4, phase_colors['Running']],    # Running - Pastel Blue
+                [0.6, phase_colors['Pending']],   # Pending - Pastel Yellow
+                [0.8, phase_colors['Partial']],   # Partial - Pastel Orange
+                [1.0, phase_colors['Not exist']]   # Not exist - Light Grey
+            ],
+            showscale=False,
+            hovertemplate='%{customdata}<extra></extra>',
+            customdata=hover_text,
+            zmin=0,
+            zmax=5
+        ))
+
+        # Add FOV numbers as text annotations
+        annotations = []
         for i in range(visual_grid_array.shape[0]):
             for j in range(visual_grid_array.shape[1]):
-                fov_num = visual_grid_array[i, j]
-                ax.text(j, i, str(fov_num), ha='center', va='center', 
-                       fontsize=10, color='black', weight='normal')
-        
-        # Create legend with all possible phases (not just the ones in current data)
-        all_phases = ['Succeeded', 'Running', 'Pending', 'Failed', 'Not exist']
-        legend_elements = []
-        for phase in all_phases:
-            legend_elements.append(plt.Line2D([0], [0], marker='o', color='w', 
-                                            markerfacecolor=phase_colors[phase], 
-                                            markersize=10, label=phase))
-        
-        ax.legend(handles=legend_elements, loc='center left', bbox_to_anchor=(1, 0.5))
-        
-        # Set title and remove axes
-        workflow_name = seq_workflows.iloc[0]['workflow_name'] if len(seq_workflows) > 0 else 'No Data'
-        ax.set_title(f"Workflow Progress - {workflow_name} - Time Point {seq}", 
-                    fontsize=14, pad=20)
-        
-        ax.set_xticks([])
-        ax.set_yticks([])
-        ax.set_xlabel('')
-        ax.set_ylabel('')
-        
-        # Remove spines
-        for spine in ax.spines.values():
-            spine.set_visible(False)
-        
-        plt.tight_layout()
-        plt.show()
-        
-        # Print workflow summary
-        if len(seq_workflows) > 0:
-            phase_counts = seq_workflows['phase'].value_counts()
-            print(f"\n📊 Workflow Summary for Time Point {seq}: Total {len(seq_workflows)}")
-            for phase, count in phase_counts.items():
-                print(f"  {phase}: {count}")
+                annotations.append(
+                    dict(
+                        x=j, y=i,
+                        text=str(visual_grid_array[i, j]),
+                        showarrow=False,
+                        font=dict(color="black", size=10),
+                        xref="x", yref="y"
+                    )
+                )
+
+        fig.update_layout(
+            title=f"Workflow Progress - {seq_workflows.iloc[0]['workflow_name'] if len(seq_workflows) > 0 else 'No Data'} - Sequence {seq}",
+            xaxis=dict(showticklabels=False, showgrid=False, zeroline=False),
+            yaxis=dict(showticklabels=False, showgrid=False, zeroline=False, autorange='reversed'),
+            annotations=annotations,
+            width=800,
+            height=600
+        )
+
+        # Add legend using phase_colors
+        legend_elements = [
+            dict(name="Succeeded", marker=dict(color=phase_colors['Succeeded'])),
+            dict(name="Partial", marker=dict(color=phase_colors['Partial'])),
+            dict(name="Pending", marker=dict(color=phase_colors['Pending'])),
+            dict(name="Running", marker=dict(color=phase_colors['Running'])),
+            dict(name="Failed", marker=dict(color=phase_colors['Failed'])),
+            dict(name="Not exist", marker=dict(color=phase_colors['Not exist']))
+        ]
+
+        # Add invisible scatter traces for legend
+        for element in legend_elements:
+            fig.add_trace(go.Scatter(
+                x=[None], y=[None],
+                mode='markers',
+                marker=dict(size=10, color=element['marker']['color']),
+                name=element['name'],
+                showlegend=True
+            ))
+
+        fig.show()
 
 
 def create_workflow_selector(sample: Sample):
@@ -266,7 +284,6 @@ def create_workflow_selector(sample: Sample):
             if 'workflow_name' in filtered_df.columns:
                 filtered_df = filtered_df[filtered_df['workflow_name'] == workflow_dropdown.value]
             
-            # Show summary of filtered data
             if len(filtered_df) > 0:
                 workflows_progress_heatmaps(sample, filtered_df)
             else:
@@ -480,7 +497,6 @@ def remove_outliers_from_dataframe(
         print(f"❌ Critical error in remove_outliers_from_dataframe: {e}")
         import traceback; traceback.print_exc()
         return df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
-
 
 
 def create_outlier_filtering_controls(sample, data, data_type="wells_data"):
@@ -1254,7 +1270,6 @@ def run_heatmap(filtered_df, sample, selected_feature, selected_title, selected_
         print(f"❌ Critical error in run_heatmap: {str(e)}")
         import traceback
         traceback.print_exc()
-
 
 
 def plot_interactive_scatter(df, controls, eps=300, min_samples=5):

@@ -161,3 +161,19 @@ def get_assay_workflows(assay_id: str) -> dict:
         print(f"Error in get_assay_workflows for {assay_id}: {response.status_code} - {error_detail}")
     workflows = response.json()
     return workflows
+
+def get_vizarr_url() -> dict:
+    url = f'http://{get_service_ip()}/api/get_vizarr_url'
+    try:
+        response = requests.get(url)
+        if not response.status_code == 200:
+            try:
+                error_detail = response.json().get('detail', 'Unknown error')
+            except:
+                error_detail = response.text if response.text else 'Unknown error'
+            print(f"Error in get_vizarr_url: {response.status_code} - {error_detail}")
+    
+        vizarr_url = response.json()
+    except:  # Fallback to default URL if service is unreachable
+        vizarr_url = 'https://green-wave-0a25ef503.1.azurestaticapps.net'
+    return vizarr_url
